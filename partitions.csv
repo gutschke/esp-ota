@@ -1,0 +1,42 @@
+# ESP-IDF Partition Table
+#
+# The various small helper partitions (e.g. NVS) must be aligned on a flash
+# segment boundary (i.e. 4kB). Application and filesystem partitions must be
+# aligned on a 64kB boundary.
+#
+# Flash memory starts with a first stage bootloader at 0x0000 and is followed
+# by a second stage boot loader at 0x1000. There also is a read-only zero-stage
+# boot loader in the microcontroller itself.
+#
+# Unless configured otherwise the partition table is 3kB long and is stored at
+# 0x8000. The 1kB remaining in that flash sector is only used if secure boot has
+# been enabled. Our code does not currently support secure boot signatures.
+#
+# This means that starting from 0x9000 we can store user-defined partitions. If
+# WiFi is enabled we must have a NVS key-value-pair storage partition. Size
+# is somewhat flexible and can be shrunk a lot. But since we need to fill up
+# the full 64kB for alignment reasons we might as well take up all that space.
+# NVS storage is actually quite useful for all sort of configuration data and
+# it has a log-based format that is optimed for storage of small values in
+# flash memory.
+#
+# We then add an oversized partition to store the main application. Unlike with
+# many other ESP-IDF projects we don't set aside space for OTA or "test"
+# partitions. This effectively means that there is no practical limit to the
+# size of the application that we can store in flash.
+#
+# We also allocate space for a filesystem partition that will ultimated hold
+# our data. Initially this is just a place holder of zero size. Upon first
+# booting the partition table will be rewritten to optimally use the space for
+# both the application and the filesystem. This could probably also be done
+# by CMake at build-time but I haven't looked into how complex it would be to
+# hook up that logic.
+#
+# When OTA upgrades are performed we use custom-code that temporarily wipes
+# the data partition to perform the upgrade. Afterwards the data image has to
+# be restored. This can also be done through an OTA process.
+#
+# Name,      Type, SubType, Offset,   Size,     Flags
+nvs,         data, nvs,     0x9000,   0x5000,
+application, app,  factory, 0x10000,  0x3f0000,
+data,        data, spiffs,  0x400000, 0x0,
