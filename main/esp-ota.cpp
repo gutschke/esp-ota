@@ -114,8 +114,8 @@ static void switchPartitionMode(bool enableOTAMode) {
       // that can be compiled-out.
       assert(i < ESP_PARTITION_TABLE_MAX_ENTRIES - 1 &&
              partitions[i + 1].magic == 0xFFFF);
-      break;
 #endif
+      break;
     } else if (entry.magic == 0xFFFF) {
 #if CONFIG_LOG_DEFAULT_LEVEL != LOG_LEVEL_NONE
       // The partition table ends, when we find the 0xFFFF end-of-table marker.
@@ -130,7 +130,7 @@ static void switchPartitionMode(bool enableOTAMode) {
       abort();
     }
   }
-  assert(appIdx >= 0 && dataOrTestIdx >= 0);
+  assert(appIdx >= 0 && dataOrTestIdx == appIdx + 1);
 
   // Parse the application's image file and compute the space required to store
   // it. This requires iterating over the flash information and finding all
