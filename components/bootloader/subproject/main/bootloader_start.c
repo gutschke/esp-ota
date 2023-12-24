@@ -4,12 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <stdbool.h>
+#include <string.h>
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "bootloader_init.h"
 #include "bootloader_utility.h"
 #include "bootloader_common.h"
 #include "bootloader_hooks.h"
+#include "bootloader_params.h"
 
 static const char *TAG = "boot";
 
@@ -64,6 +66,21 @@ static int select_partition_number(bootloader_state_t *bs)
     if (!bootloader_utility_load_partition_table(bs)) {
         ESP_LOGE(TAG, "load partition table error!");
         return INVALID_INDEX;
+    }
+
+    // Check if this is an on-demand reboot into a non-standard partition
+    bootloader_params_t* params =
+        (bootloader_params_t *)&bootloader_common_get_rtc_retain_mem()->custom;
+    if (esp_rom_get_reset_reason(0) == RESET_REASON_CHIP_POWER_ON) {
+        ESP_LOGI(TAG, "Upon power-on, resetting custom boot configuration in RTC memory");
+        memset(params, 0, sizeof(*params));
+        params->partition_index = FACTORY_INDEX;
+    } else {
+        int8_t partition = params->partition_index;
+        if (partition != FACTORY_INDEX) {
+            params->partition_index = FACTORY_INDEX;
+            return partition;
+        }
     }
 
     // 2. Select the number of boot partition

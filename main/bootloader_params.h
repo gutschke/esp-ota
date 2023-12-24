@@ -1,0 +1,1 @@
+../components/bootloader/subproject/main/bootloader_params.h
