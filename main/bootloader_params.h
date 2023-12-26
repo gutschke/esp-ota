@@ -1,1 +1,1 @@
-../components/bootloader/subproject/main/bootloader_params.h
+../bootloader_components/main/bootloader_params.h
