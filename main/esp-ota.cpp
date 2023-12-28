@@ -334,13 +334,13 @@ static esp_err_t getHandler(httpd_req_t* req) {
 
 // Initialize the webserver.
 static void initHTTPD() {
-  httpd_uri_t handler{.uri = "", .method = HTTP_GET, .handler = getHandler};
   const auto matchAll = [](const char*, const char*, size_t) { return true; };
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.uri_match_fn = matchAll;
   cfg.enable_so_linger = true;
   httpd_handle_t httpServer = NULL;
   if (!httpd_start(&httpServer, &cfg)) {
+    httpd_uri_t handler{.uri = "", .method = HTTP_GET, .handler = getHandler};
     httpd_register_uri_handler(httpServer, &handler);
   }
   for (auto err = httpd_err_code_t{}; err < HTTPD_ERR_CODE_MAX;
@@ -362,6 +362,10 @@ static void initHTTPD() {
   ssl.prvtkey_len = keyEnd - keyStart;
   httpd_handle_t httpsServer = NULL;
   if (!httpd_ssl_start(&httpsServer, &ssl)) {
+    httpd_uri_t handler{
+        .uri = "", .method = HTTP_GET, .handler = [](httpd_req_t* req) {
+          return redirectHandler(req);
+        }};
     httpd_register_uri_handler(httpsServer, &handler);
   }
   for (auto err = httpd_err_code_t{}; err < HTTPD_ERR_CODE_MAX;
