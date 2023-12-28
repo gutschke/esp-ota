@@ -28,9 +28,9 @@
 # We also allocate space for a filesystem partition that will ultimated hold
 # our data. Initially this is just a place holder of zero size. Upon first
 # booting the partition table will be rewritten to optimally use the space for
-# both the application and the filesystem. This could probably also be done
-# by CMake at build-time but I haven't looked into how complex it would be to
-# hook up that logic.
+# both the application and the filesystem. Our build system also attempt to
+# automatically adjust the size just before flashing the partition table. So
+# the app might not actually have to do anything if that went OK.
 #
 # When OTA upgrades are performed we use custom-code that temporarily wipes
 # the data partition to perform the upgrade. Afterwards the data image has to
