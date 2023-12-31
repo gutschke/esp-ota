@@ -1,10 +1,11 @@
 #include <cstring>
+#include <map>
 #include <memory>
 
 #include "bootloader_common.h"
 #include "bootloader_params.h"
 #include "dhcp-options.h"
-#include "esp_https_server.h"
+#include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -21,14 +22,23 @@
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
+// Change this function pointer, if you have an app that can display it's on web
+// UI.
+static esp_err_t (*mainAppHttpHandler)(httpd_req_t* req);
+
 // Pass state from the event handler to the network-related tasks.
 struct NetworkState {
   esp_netif_t *ap, *sta;
 };
 
+// Notify web socket connections of WiFi scan results.
+static bool wifiScanning{false};
+static std::map<httpd_handle_t, int> wsSessions;
+
 // Our WiFi settings for both STA (if available) and AP mode.
 static wifi_config_t wifiStaConfig{
-    .sta{.threshold{.authmode{WIFI_AUTH_WPA_PSK}},
+    .sta{.scan_method{WIFI_ALL_CHANNEL_SCAN},
+         .threshold{.authmode{WIFI_AUTH_WPA_PSK}},
          .pmf_cfg = {.capable{true}, .required{false}}},
 };
 static wifi_config_t wifiApConfig{
@@ -74,7 +84,8 @@ static void switchPartitionMode(bool enableOTAMode) {
   // reading larger amounts of data from flash, such as the 3kB partition
   // table.
   std::unique_ptr<esp_partition_info_t[]> partitions(
-      new esp_partition_info_t[ESP_PARTITION_TABLE_MAX_ENTRIES]);
+      new (std::nothrow) esp_partition_info_t[ESP_PARTITION_TABLE_MAX_ENTRIES]);
+  assert(partitions);
   ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "Reading partition table from 0x%x",
            CONFIG_PARTITION_TABLE_OFFSET);
   ESP_ERROR_CHECK(esp_flash_read(NULL, partitions.get(),
@@ -127,7 +138,7 @@ static void switchPartitionMode(bool enableOTAMode) {
       for (int i = 0; i < 16; ++i)
         sprintf(&buf[3 * i], "%02X ", digest[i]);
       ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "MD5 digest: %s", buf);
-      struct MD5Context md5ctx;
+      MD5Context md5ctx;
       esp_rom_md5_init(&md5ctx);
       esp_rom_md5_update(&md5ctx, (uint8_t*)partitions.get(),
                          i * sizeof(entry));
@@ -218,7 +229,8 @@ static void switchPartitionMode(bool enableOTAMode) {
                "Relocate ourselves into the test partition");
       ESP_ERROR_CHECK(esp_flash_erase_region(&rw, appOffset + appSz,
                                              flashSz - appOffset - appSz));
-      std::unique_ptr<char[]> sector(new char[sectorSz]);
+      std::unique_ptr<char[]> sector(new (std::nothrow) char[sectorSz]);
+      assert(sector);
       for (size_t offset = 0; offset < appSz; offset += sectorSz) {
         ESP_ERROR_CHECK(
             esp_flash_read(NULL, sector.get(), appOffset + offset, sectorSz));
@@ -250,7 +262,7 @@ static void switchPartitionMode(bool enableOTAMode) {
       partitions[dataOrTestIdx].pos.size = dataOrTestSz;
       // Of course, any time the partition table changes, we have to recompute
       // the MD5 checksum, if present.
-      struct MD5Context md5ctx;
+      MD5Context md5ctx;
       esp_rom_md5_init(&md5ctx);
       for (auto i = 0; i < ESP_PARTITION_TABLE_MAX_ENTRIES; ++i) {
         const esp_partition_info_t& entry = partitions[i];
@@ -293,92 +305,307 @@ static void switchPartitionMode(bool enableOTAMode) {
   return;
 }
 
-// Redirect all unexpect requests to our main page.
-static esp_err_t redirectHandler(httpd_req_t* req,
-                                 httpd_err_code_t err = httpd_err_code_t{}) {
+// The number of web socket listeners has changed. Update the WiFi scan mode.
+static void wifiScanner() {
+  const bool hasListeners = !!wsSessions.size();
+  if (wifiScanning != hasListeners) {
+    wifiScanning = hasListeners;
+    if (wifiScanning) {
+      wifi_scan_config_t cfg{.show_hidden{false},
+                             .scan_type{WIFI_SCAN_TYPE_ACTIVE},
+                             .scan_time{.active{.max{100}}},
+                             .home_chan_dwell_time{250}};
+      esp_wifi_scan_start(&cfg, false);
+    } else
+      esp_wifi_scan_stop();
+  }
+  return;
+}
+
+// Checks whether the client connected to our AP which is used for the
+// configuration GUI, or whether our HTTP server is operating in STA mode. In
+// that case, we don't expose the configuration interface.
+static bool clientConnectedToAP(httpd_req_t* req) {
+  auto fd = httpd_req_to_sockfd(req);
+  sockaddr_in6 in;
+  socklen_t inLen = sizeof(in);
+  if (!getsockname(fd, (sockaddr*)&in, &inLen)) {
+    auto ap = ((NetworkState*)req->user_ctx)->ap;
+    esp_netif_ip_info_t info;
+    esp_netif_get_ip_info(ap, &info);
+    return !memcmp(&info.ip.addr, &in.sin6_addr.un.u32_addr[3],
+                   sizeof(info.ip.addr));
+  }
+  return true;
+}
+
+// Redirect all unexpected requests to our main page. This is part of the
+// captive portal configuration.
+static esp_err_t redirectHandler(httpd_req_t* req, const char* path = "") {
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_status(req, "301 Moved Permanently");
   auto fd = httpd_req_to_sockfd(req);
   sockaddr_in6 in;
   socklen_t len = sizeof(in);
   if (!getsockname(fd, (sockaddr*)&in, &len)) {
-    char buf[30];
-    snprintf(buf, sizeof(buf), "http://%s/",
+    char buf[40 + sizeof(CONFIG_LWIP_LOCAL_HOSTNAME)];
+    snprintf(buf, sizeof(buf), "http://%s/%s",
              inet_ntop(AF_INET, &in.sin6_addr.un.u32_addr[3],
-                       &buf[sizeof(buf) - 16], 16));
+                       &buf[sizeof(buf) - 16], 16),
+             path);
     httpd_resp_set_hdr(req, "Location", buf);
   }
   return httpd_resp_send(req, NULL, 0);
 }
 
-// Return static files in response to HTTP requests.
-static esp_err_t getHandler(httpd_req_t* req) {
-  extern const char index_html_start[] asm("_binary_index_html_start");
-  extern const char index_html_end[] asm("_binary_index_html_end");
-  static const struct {
-    const char *path, *mimeType, *data;
-    const size_t len;
-  } files[] = {
-      {"/", "text/html", index_html_start,
-       (size_t)(index_html_end - index_html_start)},
-  };
-  for (int i = sizeof(files) / sizeof(*files); i--;) {
-    if (!strcmp(req->uri, files[i].path)) {
-      httpd_resp_set_type(req, files[i].mimeType);
-      httpd_resp_send(req, files[i].data, files[i].len);
-      return ESP_OK;
-    }
+// We asked the web socket subsystem to send us control messages. That means, we
+// are now responsible to actually respond to them.
+static esp_err_t maybeHandleWSCtrl(httpd_req_t* req,
+                                   httpd_ws_type_t* type = 0,
+                                   char** buf = 0,
+                                   size_t* len = 0) {
+  // Check if this is even web socket connection in the first place. The caller
+  // shouldn't have called us otherwise.
+  if (buf) *buf = NULL;
+  if (len) *len = 0;
+  if (type) *type = (httpd_ws_type_t)-1;
+  if (req->method) {
+    return ESP_ERR_INVALID_STATE;
   }
-  return redirectHandler(req);
+  // Prepare to load the web socket payload;
+  httpd_ws_frame_t wsPacket = {.type = HTTPD_WS_TYPE_TEXT};
+  auto rc = httpd_ws_recv_frame(req, &wsPacket, 0);
+  if (rc < 0) return rc;
+
+  // Knowing the payload length, we can try to retrieve the data.
+  if (wsPacket.len > 0) {
+    wsPacket.payload = (uint8_t*)malloc(wsPacket.len + 1);
+    if (!wsPacket.payload) return ESP_ERR_NO_MEM;
+    rc = httpd_ws_recv_frame(req, &wsPacket, wsPacket.len);
+    if (rc < 0) goto done;
+    wsPacket.payload[wsPacket.len] = '\0';
+  }
+  if (type) *type = wsPacket.type;
+  switch (wsPacket.type) {
+    case HTTPD_WS_TYPE_PING:
+      wsPacket.type = HTTPD_WS_TYPE_PONG;
+      goto respond;
+    case HTTPD_WS_TYPE_CLOSE:
+      free(wsPacket.payload);
+      wsPacket.payload = NULL;
+      wsPacket.len = 0;
+    respond:
+      rc = httpd_ws_send_frame(req, &wsPacket);
+      break;
+    default:
+      break;
+  }
+  if (buf && len) {
+    *buf = (char*)wsPacket.payload;
+    *len = wsPacket.len;
+    return rc;
+  }
+done:
+  free(wsPacket.payload);
+  return rc;
 }
 
-// Initialize the webserver.
-static void initHTTPD() {
+// The web server for the configuration GUI supports both GET requests for
+// static embedded files and web socket requests for configuration management.
+static esp_err_t cfgHttpHandler(httpd_req_t* req) {
+  if (req->method == HTTP_GET) {
+    // If this is an HTTP connection in the process of being upgraded to a web
+    // socket connection, we shouldn't try to return any data for the request.
+    // It's just going to mess up the web socket.
+    auto rc =
+        httpd_req_get_hdr_value_str(req, "Sec-WebSocket-Protocol", NULL, 0);
+    if (rc == ESP_OK || rc == ESP_ERR_HTTPD_RESULT_TRUNC) {
+#ifdef __EXCEPTIONS
+      try {
+#endif
+        wsSessions[req->handle] = httpd_req_to_sockfd(req);
+#ifdef __EXCEPTIONS
+      } catch (const std::bad_alloc&) {
+        wsSessions.clear();
+      }
+#endif
+      wifiScanner();
+      return ESP_OK;
+    }
+    extern const char index_start[] asm("_binary_idx_start");
+    extern const char index_end[] asm("_binary_idx_end");
+    static const struct {
+      const char *path, *mimeType, *data;
+      const size_t len;
+    } files[] = {
+        // Add more embedded static files here. Try to minimize the number of
+        // active HTTP requests though. Our network stack and the HTTP server
+        // have very small resource limits. This means, instead of referencing
+        // other resources from within HTML files, it is more efficient to try
+        // to bundle them all inside the same file.
+        {"/", "text/html", index_start, (size_t)(index_end - index_start)},
+    };
+    for (int i = sizeof(files) / sizeof(*files); i--;) {
+      if (!strcmp(req->uri, files[i].path)) {
+        httpd_resp_set_type(req, files[i].mimeType);
+        return httpd_resp_send(req, files[i].data, files[i].len);
+      }
+    }
+    return redirectHandler(req);
+  }
+  // If we get here, we must be working with a web socket. Determine the
+  // payload length.
+  httpd_ws_type_t type;
+  char* buf;
+  size_t len;
+  auto rc = maybeHandleWSCtrl(req, &type, &buf, &len);
+  switch (type) {
+    case HTTPD_WS_TYPE_CLOSE:
+      wsSessions.erase(req->handle);
+      wifiScanner();
+      break;
+    case HTTPD_WS_TYPE_TEXT:
+    case HTTPD_WS_TYPE_BINARY:
+      break;
+    default:
+      break;
+  }
+  free(buf);
+  return rc;
+}
+
+// Immediately reset all requests arriving on port 443. That's good enough to
+// make browsers give up on automatically upgrading captive portals to HTTPS.
+static void reset443(void* arg) {
+  auto ap = (esp_netif_t*)arg;
+  for (int sock;;) {
+    for (;;) {
+      // Try opening the socket until it succeeds.
+      sock = socket(AF_INET, SOCK_STREAM, 0);
+      if (sock >= 0) break;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    // Only listen on the IP address of the SoftAP. It shouldn't ever
+    // change at run-time, but just to be on the safe side, we reload the
+    // IP address if every time. For now, we only support IPv4, though.
+    esp_netif_ip_info_t info;
+    esp_netif_get_ip_info(ap, &info);
+    sockaddr_in httpsAddr{
+        .sin_len{sizeof(httpsAddr)},
+        .sin_family{AF_INET},
+        .sin_port{htons(443)},
+        .sin_addr{info.ip.addr},
+    };
+    // If we can't listen on the interface, try again later. Maybe, the SoftAP
+    // is (re)intializing.
+    if (bind(sock, (sockaddr*)&httpsAddr, sizeof(httpsAddr)) < 0) {
+    err:
+      close(sock);
+      continue;
+    }
+    for (int fd;;) {
+      if (listen(sock, 5) || (fd = accept(sock, 0, 0)) < 0) goto err;
+      close(fd);
+    }
+  }
+}
+
+// Return static files in response to HTTP requests or handle web socket
+// requests. Also, implement reasonable heuristics for whether we should
+// show the initial configuration GUI (e.g. for setting the site-specific WiFi
+// credentials) or whether to show the main application.
+static esp_err_t httpHandler(httpd_req_t* req) {
+  // By default, when accessing the root of the web server, the configuration
+  // GUI is exposed on the SoftAP, whereas the main application is accessible
+  // when the device connected in STA mode.
+  // Upon a user's request, the application can also be started from the
+  // configuration GUI and will then become accessible at the root URI until
+  // power-cycled. The special URIs "/${APP}-cfg" and "/${APP}-app" are
+  // always available to by-pass this automated mechanism.
+  bool forceApp = false, forceCfg = false;
+  const auto uri = req->uri;
+  if (*uri == '/' && !memcmp(uri + 1, CONFIG_LWIP_LOCAL_HOSTNAME,
+                             sizeof(CONFIG_LWIP_LOCAL_HOSTNAME))) {
+    size_t removeCount = sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) - 1;
+    if (!memcmp(&uri[sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) + 1], "-app", 4)) {
+      removeCount += sizeof("-app") - 1;
+      forceApp = true;
+      goto removeURIPath;
+    } else if (!memcmp(&uri[sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) + 1], "-cfg",
+                       4)) {
+      removeCount += sizeof("-cfg") - 1;
+      forceCfg = true;
+    removeURIPath:
+      memmove((char*)&uri[1], &uri[removeCount + 1],
+              strlen(&uri[removeCount + 1]) + 1);
+    }
+  }
+  bool onSoftAP = clientConnectedToAP(req);
+  // If accessing through the SoftAP (which defaults to showing the
+  // configuration GUI upon power on), permanently switch to the main
+  // application the first time it gets access. This can be reset by power
+  // cycling. Or of course, the user can always explicitly decide to go to
+  // "${APP}-app".
+  static bool appEnabled = false;
+  appEnabled |= onSoftAP && forceApp;
+  // There are several conditions that make us display the main app, and a
+  // few that make us display the configuration GUI. Of course, all of this is
+  // moot, if there isn't even a main app registered.
+  if ((appEnabled || !onSoftAP || forceApp) && !forceCfg)
+    if (mainAppHttpHandler) {
+      // We asked the web socket subsystem to send us control messages. This
+      // means we are responsible for implementing them. The main application
+      // might not know how to do so, though.
+      return mainAppHttpHandler(req);
+    }
+  return cfgHttpHandler(req);
+}
+
+// Initialize the webserver. This creates both a regular web server for
+// unencrypted HTTP and another one for HTTPS. The HTTPS server isn't really
+// good for much, as it immediately resets the connection after accepting it.
+// That's just enough to make captive portals work, when browsers implement
+// opportunistic HTTPS-upgrade. We could of course implement SSL, but that
+// takes up a lot of space in flash, and as a local device that doesn't have
+// any way of getting a valid SSL certificate, we'd only be using self-signed
+// certificates anyway. That doesn't help much, and it really doesn't help
+// with captive portals.
+static void initHTTPD(NetworkState* state) {
   const auto matchAll = [](const char*, const char*, size_t) { return true; };
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.uri_match_fn = matchAll;
   cfg.enable_so_linger = true;
+  cfg.close_fn = [](httpd_handle_t hd, int fd) {
+    wsSessions.erase(hd);
+    close(fd);
+    wifiScanner();
+  };
   httpd_handle_t httpServer = NULL;
   if (!httpd_start(&httpServer, &cfg)) {
-    httpd_uri_t handler{.uri = "", .method = HTTP_GET, .handler = getHandler};
+    httpd_uri_t handler{.uri = "",
+                        .method = HTTP_GET,
+                        .handler = httpHandler,
+                        .user_ctx = state,
+                        .is_websocket = true,
+                        .handle_ws_control_frames = true,
+                        .supported_subprotocol = "cfg"};
     httpd_register_uri_handler(httpServer, &handler);
   }
+  const auto alwaysRedirect = [](httpd_req* req, httpd_err_code_t err) {
+    return redirectHandler(req);
+  };
   for (auto err = httpd_err_code_t{}; err < HTTPD_ERR_CODE_MAX;
        err = (httpd_err_code_t)((int)err + 1)) {
-    httpd_register_err_handler(httpServer, err, redirectHandler);
+    httpd_register_err_handler(httpServer, err, alwaysRedirect);
   }
-#if 1
-  httpd_ssl_config_t ssl = HTTPD_SSL_CONFIG_DEFAULT();
-  ssl.httpd.uri_match_fn = matchAll;
-  ssl.httpd.enable_so_linger = true;
-  ssl.httpd.ctrl_port++;
-  extern const uint8_t certStart[] asm("_binary_cert_pem_start");
-  extern const uint8_t certEnd[] asm("_binary_cert_pem_end");
-  ssl.servercert = certStart;
-  ssl.servercert_len = certEnd - certStart;
-  extern const uint8_t keyStart[] asm("_binary_key_pem_start");
-  extern const uint8_t keyEnd[] asm("_binary_key_pem_end");
-  ssl.prvtkey_pem = keyStart;
-  ssl.prvtkey_len = keyEnd - keyStart;
-  httpd_handle_t httpsServer = NULL;
-  if (!httpd_ssl_start(&httpsServer, &ssl)) {
-    httpd_uri_t handler{
-        .uri = "", .method = HTTP_GET, .handler = [](httpd_req_t* req) {
-          return redirectHandler(req);
-        }};
-    httpd_register_uri_handler(httpsServer, &handler);
-  }
-  for (auto err = httpd_err_code_t{}; err < HTTPD_ERR_CODE_MAX;
-       err = (httpd_err_code_t)((int)err + 1)) {
-    httpd_register_err_handler(httpsServer, err, redirectHandler);
-  }
-#endif
+  xTaskCreate(reset443, "fakehttps", 2048, state->ap, configMAX_PRIORITIES - 1,
+              0);
   return;
 }
 
 // Advertise our own IP address as a captive portal in the DHCP response.
-void dhcpsPostAppendOpts(struct netif* netif,
-                         struct dhcps_t* dhcps,
+void dhcpsPostAppendOpts(netif* netif,
+                         dhcps_t* dhcps,
                          uint8_t state,
                          uint8_t** pp_opts) {
   auto captive = *pp_opts;
@@ -463,7 +690,8 @@ static void captivePortalDNS(void* arg) {
         // over query strings a little more difficult. We probably don't need
         // to worry too much, since we only handle DNS requests that have a
         // single query and those don't really compress. But we still perform
-        // some minimal parsing. Fortunately, full decompression isn't required.
+        // some minimal parsing. Fortunately, full decompression isn't
+        // required.
         uint8_t *in = &req[sizeof(Header)], *nxt = 0;
         while (in >= req && in < &req[len]) {
           if (!*in) {
@@ -529,21 +757,129 @@ static void captivePortalDNS(void* arg) {
 // essentially the continuation of what initNetwork() does, and it performs a
 // few additional initializations that had to wait for the WiFi subsystem to
 // fully come up asynchronously.
+template <typename T>
+struct CaseInsensitiveLess {
+  bool operator()(T lhs, T rhs) const {
+    return strcasecmp((char*)lhs.data(), (char*)rhs.data()) < 0;
+  }
+};
 static void wifiEventHandler(void* arg,
                              esp_event_base_t eventBase,
                              int32_t eventId,
                              void* eventData) {
-  const auto& state = *(struct NetworkState*)arg;
-  if (eventBase == WIFI_EVENT && (eventId == WIFI_EVENT_STA_START ||
-                                  eventId == WIFI_EVENT_STA_DISCONNECTED)) {
-    esp_wifi_connect();
-  } else if (eventBase == WIFI_EVENT && eventId == WIFI_EVENT_AP_START) {
-    static TaskHandle_t handle = 0;
-    if (!handle) {
-      xTaskCreate(captivePortalDNS, "captivedns", 4096, state.ap,
-                  configMAX_PRIORITIES - 1, &handle);
+  const auto& state = *(NetworkState*)arg;
+  if (eventBase == WIFI_EVENT) switch (eventId) {
+      case WIFI_EVENT_SCAN_DONE: {
+        uint16_t num;
+        wifi_ap_record_t* records = NULL;
+        if (esp_wifi_scan_get_ap_num(&num) == ESP_OK) {
+          // We have to allocate enough space to hold all search results. But
+          // even if the allocation fails, we must call
+          // esp_wifi_scan_get_ap_records() to clean up resources. Error
+          // handling is tricky here.
+          if (!(records = (wifi_ap_record_t*)malloc(num * sizeof(*records))))
+            num = 0;
+          if (esp_wifi_scan_get_ap_records(&num, records) == ESP_OK && num) {
+            static std::map<
+                std::array<uint8_t, MAX_SSID_LEN + 1>, uint8_t,
+                CaseInsensitiveLess<std::array<uint8_t, MAX_SSID_LEN + 1> > >
+                ssids;
+            httpd_ws_frame_t wsPacket = {.type{HTTPD_WS_TYPE_TEXT}, .len{0}};
+#ifdef __EXCEPTIONS
+            try {
+#endif
+              static uint8_t generation{0};
+              generation++;
+              for (int i = 0; i < num; ++i)
+                if (*records[i].ssid)
+                  ssids[std::to_array(records[i].ssid)] = generation;
+              for (auto it = ssids.begin(); it != ssids.end();) {
+                // We do eventually remove stale WiFi access points when they
+                // no longer show up in scans. But since scans are notoriously
+                // unreliable, we err on the side of caching old data for
+                // quite a while.
+                if (generation - it->second > 10)
+                  it = ssids.erase(it);
+                else
+                  wsPacket.len += 1 + strlen((char*)it++->first.data());
+              }
+              if (!!(wsPacket.payload = (uint8_t*)malloc(wsPacket.len))) {
+                auto ptr = (char*)wsPacket.payload;
+                for (auto it = ssids.begin(); it != ssids.end(); ++it) {
+                  ptr += 1 + strlen(strcpy(ptr, (char*)it->first.data()));
+                }
+                // Sending a message on a web socket can trigger events that
+                // end up marking the session as closed. This can cause us to
+                // modify the "wsSessions" map concurrently with iterating
+                // over it. Create a copy of the map first and then verify
+                // that the global map still contains our session before
+                // operating on it.
+                auto cpy{wsSessions};
+                for (auto it = cpy.begin(); it != cpy.end(); ++it) {
+                  const auto old = wsSessions.find(it->first);
+                  if (old != wsSessions.end() && old->second == it->second)
+                    httpd_ws_send_data(it->first, it->second, &wsPacket);
+                }
+              }
+#ifdef __EXCEPTIONS
+            } catch (const std::bad_alloc&) {
+              ssids.clear();
+            }
+#endif
+            free(wsPacket.payload);
+          }
+        }
+        free(records);
+        wifiScanning = false;
+        wifiScanner();
+      } break;
+      case WIFI_EVENT_STA_START:
+        esp_wifi_connect();
+        break;
+      case WIFI_EVENT_STA_DISCONNECTED: {
+        wifi_sta_list_t sta{};
+        if (esp_wifi_ap_get_sta_list(&sta) != ESP_OK || !sta.num)
+          esp_wifi_connect();
+      } break;
+      case WIFI_EVENT_AP_START:
+        static TaskHandle_t handle = 0;
+        if (!handle) {
+          xTaskCreate(captivePortalDNS, "captivedns", 4096, state.ap,
+                      configMAX_PRIORITIES - 1, &handle);
+        }
+        break;
+      case WIFI_EVENT_AP_STACONNECTED:
+      case WIFI_EVENT_AP_STADISCONNECTED: {
+        // The ESP32 only has a single radio. This means, while scanning for
+        // WiFi networks to connect to in STA mode, it can't reliably maintain
+        // connections in AP mode. As a work-around, we leave APSTA mode in
+        // favor of plain AP mode, whenever somebody is connected to our
+        // SoftAP. On the other hand, if there is a working WiFi connection in
+        // both WiFi modes, no need to stop APSTA, as we aren't expected to
+        // start scanning.
+        wifi_mode_t mode{};
+        wifi_sta_list_t sta{};
+        wifi_ap_record_t ap{};
+        if (esp_wifi_get_mode(&mode) == ESP_OK &&
+            esp_wifi_ap_get_sta_list(&sta) == ESP_OK) {
+          bool online = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+          wifi_mode_t target =
+              sta.num && !online ? WIFI_MODE_AP : WIFI_MODE_APSTA;
+          ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
+                   "Currently in %s mode, %d clients are connected to us and "
+                   "we are %sonline",
+                   mode == WIFI_MODE_APSTA ? "APSTA" : "AP", sta.num,
+                   online ? "" : "not ");
+          if (target != mode) {
+            ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "Changing WiFi mode to %s",
+                     target == WIFI_MODE_APSTA ? "APSTA" : "AP");
+            esp_wifi_set_mode(target);
+          }
+        }
+      } break;
+      default:
+        break;
     }
-  }
   return;
 }
 
@@ -551,7 +887,7 @@ static void wifiEventHandler(void* arg,
 // depending on whether we know the WiFi password for the local network
 // already.
 static void initNetwork() {
-  static struct NetworkState state {};
+  static NetworkState state{};
   bool isSta = !!wifiStaConfig.sta.ssid[0];
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   if (esp_netif_init() != ESP_OK || esp_event_loop_create_default() != ESP_OK ||
@@ -572,6 +908,7 @@ static void initNetwork() {
              "Something is really wrong with WiFi. Rebooting...");
     reboot();
   }
+  initHTTPD(&state);
   return;
 }
 
@@ -598,12 +935,12 @@ static void initNVS() {
     ssid[ssidSz] = pswd[pswdSz] = '\000';
   }
   // We store a unique identifier in NVS. This is derived from the main MAC
-  // (which is not guaranteed to be unique), and from the limited amount of true
-  // randomness that we collected during boot up.
+  // (which is not guaranteed to be unique), and from the limited amount of
+  // true randomness that we collected during boot up.
   uint8_t uniqueId[16];
   auto uniqueSz = sizeof(uniqueId);
   if (nvs_get_blob(hd, "uniq", (char*)&uniqueId, &uniqueSz) != ESP_OK) {
-    struct MD5Context md5ctx;
+    MD5Context md5ctx;
     esp_rom_md5_init(&md5ctx);
     esp_fill_random(uniqueId, sizeof(uniqueId));
     esp_rom_md5_update(&md5ctx, uniqueId, sizeof(uniqueId));
@@ -638,7 +975,6 @@ extern "C" void app_main() {
   // Enable WiFi network.
   initNVS();
   initNetwork();
-  initHTTPD();
 
   if (!inTestAppPartition()) {
     // If our partition table is currently not optimal and allocates too much

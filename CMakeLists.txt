@@ -9,6 +9,6 @@ project(esp-ota)
 idf_component_get_property(lwip lwip COMPONENT_LIB)
 target_compile_definitions(${lwip} PRIVATE "-DESP_IDF_LWIP_HOOK_FILENAME=\"${PROJECT_DIR}/main/dhcp-options.h\"")
 add_custom_target(resizepartitions
-                  DEPENDS "${PROJECT_NAME}.bin" partition_table_bin
+                  DEPENDS gen_project_binary partition_table_bin
                   COMMAND "${PROJECT_DIR}/main/resizepartitions.py" "${PROJECT_BINARY_DIR}/partition_table/partition-table.bin" "${PROJECT_BINARY_DIR}/${PROJECT_NAME}.bin")
 add_dependencies(bootloader resizepartitions)

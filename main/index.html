@@ -1,8 +1,277 @@
+<!doctype html>
 <html>
-  <head>
-    <title>Settings</title>
-  </head>
-  <body>
+<head>
+  <title>Settings</title>
+  <style>
+    // Stretch the background to cover the full window. In combination with "background-size: cover",
+    // this makes our background image always fill the full screen.
+    html, body {
+      min-height: 100%;
+    }
+
+    body {
+      background-image: url("data:image/svg+xml,
+      // The ESP32 only has a limited amount of resources and does not like too many concurrent
+      // HTTP requests. It is much more efficient to define everything inline in a single file.
+      // Normally, this would not work well for data URLs that cannot be broken across lines nor
+      // have comments. But our "collapsehtml.py" script removes all this extra syntactic sugar.
+
+      <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 700 700' width='700' height='700'>
+        <defs>
+          <linearGradient gradientTransform='rotate(150,.5,.5)' x1='50%' y1='0%' x2='50%' y2='100%' id='g'>
+            <stop stop-color='hsl(330,50%,5%)' offset='0%'></stop>
+            <stop stop-color='hsl(210,100%,50%)' offset='100%'/>
+          </linearGradient>
+          <filter id='f' x='-20%' y='-20%' width='140%' height='140%' color-interpolation-filters='sRGB'>
+            <feTurbulence type='fractalNoise' baseFrequency='.008 .006' stitchTiles='stitch' result='turbulence'/>
+            <feGaussianBlur stdDeviation='40 0' in='turbulence' edgeMode='duplicate' result='blur'/>
+            <feBlend mode='color-dodge' in='SourceGraphic' in2='blur' result='blend'/>
+          </filter>
+        </defs>
+        <rect width='700' height='700' fill='url(%23g)' filter='url(%23f)'/>
+      </svg>");
+      background-size: cover;
+      background-repeat: no-repeat;
+      font-family: Arial, Helvetica, sans-serif;
+      color: #333;
+    }
+
+    // All of our settings are contained in a partially transparent box with rounded corner.
+    body>div {
+      background-color: rgba(255, 255, 255, 0.15);
+      border-radius: 0.5em;
+      border-width: 2px;
+      border-color: #03A;
+      margin: 2em 5%;
+    }
+
+    // Make space around all the children of this out outside box.
+    body>div>* {
+      padding-left: 0.5em;
+    }
+
+    // H1 is used for the main title of the box (e.g. "Settings")
+    h1 {
+      background-color: #def;
+      border-radius: 0.5em 0.5em 0 0;
+    }
+
+    // The '#wifi' class defines a <LIST> of WiFi access point. Use CSS to make it look nice.
+    #wifi {
+      columns: 2;
+      padding: 0 2em 0 2em;
+    }
+
+    #wifi li {
+      list-style-type: none;
+      display: flex;
+      padding-bottom: 0.3em;
+    }
+
+    // Maximize the size of the SSID and password fields that the user types in.
+    #wifi li input {
+      width: 100%;
+      opacity: 80%;
+    }
+
+    // The first entry in the <LI> is either an editable <INPUT> (for a non-listed WiFi network)
+    // or a text <SPAN> with a result from actively scanning for access points.
+    #wifi li>:first-child {
+      width: 100%;
+      text-align: right;
+      display: inline-block;
+      margin-right: 15px;
+    }
+
+    // Some SSIDs that are seen in the wild are very long. They can technically be as long as
+    // 32 characters. Make a reasonable effort to show them, but at some point it's better to
+    // clip than to clutter up the user interface unnecessarily.
+    #wifi li:not(:first-child)>:first-child {
+      overflow: hidden;
+      font-stretch: 60%;
+      text-wrap: no-wrap;
+    }
+
+    // Align buttons to the right side of the box.
+    body>div>span {
+      text-align: right;
+      width: 100%;
+      display: inline-block;
+      margin-top: 1em;
+      margin-bottom: 2em;
+    }
+
+    // Style our buttons to look a little more 3D
+    input[type="button"],
+    input[type="submit"] {
+      margin-right: 2em;
+      border: 0;
+      line-height: 2.5;
+      padding: 0 2em;
+      font-size: 1rem;
+      text-align: center;
+      color: #fff;
+      text-shadow: 1px 1px 1px #000;
+      border-radius: 10px;
+      background-color: #3af;
+      background-image: linear-gradient(to top left,
+          rgba(0, 0, 0, 0.2),
+          rgba(0, 0, 0, 0.2) 30%,
+          rgba(0, 0, 0, 0));
+      box-shadow:
+        inset 1px 1px 2px rgba(255, 255, 255, 0.6),
+        inset -1px -1px 2px rgba(0, 0, 0, 0.6);
+    }
+
+    input[type="button"]:hover,
+    input[type="submit"]:hover {
+      background-color: #28d;
+    }
+
+    input[type="button"]:active:not(:disabled),
+    input[type="submit"]:active:not(:disabled) {
+      box-shadow:
+        inset -1px -1px 2px rgba(255, 255, 255, 0.6),
+        inset 1px 1px 2px rgba(0, 0, 0, 0.6);
+    }
+
+    input[type="button"]:disabled,
+    input[type="submit"]:disabled {
+      background-color: #ccf;
+    }
+  </style>
+  <script>
+    let ws = undefined;
+    let tmo = undefined;
+
+    function joinWifiCallback() {
+      return false;
+    }
+
+    function updateWiFiList(ssids) {
+      if (!ssids) return;
+      let ul = document.getElementById('wifi');
+      let i = 0, j = 1;
+      while (i < ssids.length || j < ul.childElementCount) {
+        // The SSIDs are in alphabetical order, this allows us walk through both SSIDs
+        // as received from the web socket, and existing labels as part of the DOM.
+        // While walking both lists, we insert or delete as necessary. This approach
+        // ensures that even if the user is currently editing a password field, the
+        // cursor won't disappear. At worst, things shuffle around a little bit.
+        let ssid = i < ssids.length ? ssids[i] : undefined;
+        let li = ul.childNodes[j];
+        let label = li && li.childElementCount ? li.firstElementChild.textContent : undefined;
+        if (j == ul.childElementCount || (ssid && label && ssid < label)) {
+          let el = document.createElement('LI');
+          el.innerHTML = '<span></span><input type="password" placeholder="Password"/>';
+          el.firstElementChild.textContent = ssid;
+          // The DOM API makes it a little awkward to insert a child at an arbitrary
+          // position. We need a special case for insertion at the end.
+          if (li)
+            ul.insertBefore(el, li);
+          else
+            ul.appendChild(el);
+          el.oninput = wifiInputEvent;
+          j++;
+        } else if (ssid == label) {
+          j++;
+        } else {
+          ul.removeChild(li);
+        }
+        i++;
+      }
+      let join = document.getElementsByClassName('join');
+      let cst = !!(join[0].value || join[1].value);
+      let cred = !!getCredentials();
+      // If none of the listed access points contain a password, then make sure
+      // the entry fields for the unlisted APs are editable.
+      join[0].disabled = join[1].disabled = !cst && cred;
+      // If the user has filled out some of the information for an unlisted WiFi
+      // access point, disable entry on all the scanned access points.
+      for (let i = 1; i < ul.childElementCount; ++i)
+        ul.children[i].children[1].disabled = cred && !ul.children[i].children[1].value;
+      document.getElementById('joinWifi').disabled = !cred;
+    }
+
+    function getCredentials() {
+      for (el of document.getElementById('wifi').children) {
+        let id = el.firstElementChild; // SPAN containing password
+        let edit = id.firstElementChild; // null or INPUT
+        ssid = edit ? edit.value : id.innerText;
+        let pw = el.children[1].value; // INPUT password field
+        if ((edit ? ssid : pw) != "") {
+          return [ssid, pw];
+        }
+      }
+    }
+
+    // WebSockets are usually a pretty reliable way of communicating between browser and
+    // server. But WiFi scanning throws a big wrinkle into things. We can try to tweak
+    // timing values to improve the odds of maintaining a stable connection, but ultimately,
+    // the hardware has only a single radio and scanning inevitably means that the regular
+    // connection will deteriorate. Put recovery mechanisms in place to detect faulty
+    // WebSockets and try to restart.
+    function resetWebSocket() {
+      if (ws) try {
+        ws.close();
+        ws = undefined;
+      } catch (e) { }
+      clearTimeout(tmo);
+      tmo = setTimeout(makeWebSocket, 2000);
+    }
+
+    function resetTimer() {
+      clearTimeout(tmo);
+      tmo = setTimeout(resetWebSocket, 12000);
+    }
+
+    function makeWebSocket() {
+      if (!ws) {
+        ws = new WebSocket('ws://' + location.host, 'cfg');
+        ws.onmessage = (e) => { updateWiFiList(e.data.match(/[^\0]+/g)); resetTimer(); };
+        ws.onclose = (e) => { resetWebSocket(); };
+        ws.onerror = (e) => { resetWebSocket(); };
+        resetTimer();
+      }
+    }
+
+    // Any time the user inputs into the WiFi text fields, check whether we need to
+    // enable or disable UI elements.
+    function wifiInputEvent(e) {
+      let target = e.target;
+      let isJoinWiFi = target.classList.contains('join');
+      let disableOther = false;
+      for (other of document.getElementById('wifi').getElementsByTagName('INPUT')) {
+        if (other.classList.contains('join') && other.value) disableOther = true;
+        if (other == target || isJoinWiFi && other.classList.contains('join')) continue;
+        other.disabled = !!target.value || disableOther;
+      }
+      wifiButton = document.getElementById('joinWifi');
+      wifiButton.disabled = !getCredentials();
+    }
+
+    function init() {
+      for (el of document.getElementsByTagName('INPUT'))
+        el.oninput = wifiInputEvent;
+      makeWebSocket();
+    }
+  </script>
+</head>
+<body onload="init()">
+  <div>
     <h1>Settings</h1>
-  </body>
+    <h2>WiFi Networks</h2>
+    <ul id="wifi">
+      <li><span><input placeholder="Join WiFi Network" class="join" /></span><input type="password"
+          placeholder="Password" class="join" /></li>
+    </ul>
+    <span>
+      <form onsubmit="return joinWifiCallback()"><input type="submit" value="Connect" id="joinWifi" disabled /></form>
+    </span>
+    <h2>Start Main Application</h2>
+    <span>
+      <input type="button" value="Start" onclick="location.replace('/${CONFIG_LWIP_LOCAL_HOSTNAME}-app')"/>
+    </span>
+  </div>
+</body>
 </html>
