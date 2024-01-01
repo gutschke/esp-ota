@@ -397,7 +397,7 @@ static void wifiScanDone() {
       // records over time. This neatly deals with access points that only
       // respond occasionally to our scans.
       static std::map<
-          std::array<uint8_t, MAX_SSID_LEN + 1>, uint8_t,
+          std::array<uint8_t, MAX_SSID_LEN + 1>, std::pair<uint8_t, bool>,
           CaseInsensitiveLess<std::array<uint8_t, MAX_SSID_LEN + 1> > >
           ssids;
       // Since are sending data asynchronously to all the listening WebSockets,
@@ -442,16 +442,19 @@ static void wifiScanDone() {
         generation++;
         for (int i = 0; i < num; ++i)
           if (*records[i].ssid)
-            ssids[std::to_array(records[i].ssid)] = generation;
+            ssids[std::to_array(records[i].ssid)] = std::make_pair(
+                generation, records[i].authmode == WIFI_AUTH_OPEN);
         for (auto it = ssids.begin(); it != ssids.end();) {
           // We do eventually remove stale WiFi access points when they
           // no longer show up in scans. But since scans are notoriously
           // unreliable, we err on the side of caching old data for
           // quite a while.
-          if (generation - it->second > 30)
+          if ((int8_t)(generation - it->second.first) > 30)
             it = ssids.erase(it);
-          else
+          else {
+            if (it->second.second /* Open WiFi network*/) dataLen++;
             dataLen += 1 + strlen((char*)it++->first.data());
+          }
         }
         state = (State*)calloc(1, sizeof(State) + dataLen);
         if (state) {
@@ -464,6 +467,7 @@ static void wifiScanDone() {
 
           // Assemble payload of WebSocket message.
           for (auto it = ssids.begin(); it != ssids.end(); ++it) {
+            if (it->second.second /* Open WiFi network*/) *ptr++ = '\1';
             ptr += 1 + strlen(strcpy(ptr, (char*)it->first.data()));
           }
           // Sending a message on a web socket can trigger events that
