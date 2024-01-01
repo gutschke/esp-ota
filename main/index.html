@@ -89,7 +89,9 @@
     #wifi li:not(:first-child)>:first-child {
       overflow: hidden;
       font-stretch: 60%;
-      text-wrap: no-wrap;
+      text-wrap: nowrap;
+      white-space: nowrap;
+      word-break: keep-all;
     }
 
     // Align buttons to the right side of the box.
@@ -161,7 +163,8 @@
         let ssid = i < ssids.length ? ssids[i] : undefined;
         let li = ul.childNodes[j];
         let label = li && li.childElementCount ? li.firstElementChild.textContent : undefined;
-        if (j == ul.childElementCount || (ssid && label && ssid < label)) {
+        if (j == ul.childElementCount ||
+            (ssid && label && ssid.toLowerCase() < label.toLowerCase())) {
           let el = document.createElement('LI');
           el.innerHTML = '<span></span><input type="password" placeholder="Password"/>';
           el.firstElementChild.textContent = ssid;
@@ -211,27 +214,25 @@
     // the hardware has only a single radio and scanning inevitably means that the regular
     // connection will deteriorate. Put recovery mechanisms in place to detect faulty
     // WebSockets and try to restart.
-    function resetWebSocket() {
-      if (ws) try {
-        ws.close();
-        ws = undefined;
-      } catch (e) { }
+    function resetWebSocket(that) {
+      if (ws == that) ws = undefined;
+      try { that.close(); } catch (e) { }
       clearTimeout(tmo);
       tmo = setTimeout(makeWebSocket, 2000);
     }
 
-    function resetTimer() {
+    function resetTimer(that) {
       clearTimeout(tmo);
-      tmo = setTimeout(resetWebSocket, 12000);
+      tmo = setTimeout(() => { resetWebSocket(that); }, 12000);
     }
 
     function makeWebSocket() {
       if (!ws) {
-        ws = new WebSocket('ws://' + location.host, 'cfg');
-        ws.onmessage = (e) => { updateWiFiList(e.data.match(/[^\0]+/g)); resetTimer(); };
-        ws.onclose = (e) => { resetWebSocket(); };
-        ws.onerror = (e) => { resetWebSocket(); };
-        resetTimer();
+        let that = ws = new WebSocket('ws://' + location.host, 'cfg');
+        ws.onmessage = (e) => { updateWiFiList(e.data.match(/[^\0]+/g)); resetTimer(that); ws.send(' '); };
+        ws.onclose = (e) => { resetWebSocket(that); };
+        ws.onerror = (e) => { resetWebSocket(that); };
+        resetTimer(that);
       }
     }
 

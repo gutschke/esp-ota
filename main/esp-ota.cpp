@@ -12,6 +12,7 @@
 #include "esp_partition.h"
 #include "esp_rom_md5.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -32,8 +33,17 @@ struct NetworkState {
 };
 
 // Notify web socket connections of WiFi scan results.
+struct WSState {
+  httpd_handle_t hd;
+  int fd;
+  uint16_t peer;
+  bool operator<(const WSState& x) const {
+    return hd < x.hd ||
+           (hd == x.hd && (fd < x.fd || (fd == x.fd && peer < x.peer)));
+  }
+};
+static std::map<WSState, bool> wsSessions;
 static bool wifiScanning{false};
-static std::map<httpd_handle_t, int> wsSessions;
 
 // Our WiFi settings for both STA (if available) and AP mode.
 static wifi_config_t wifiStaConfig{
@@ -305,20 +315,201 @@ static void switchPartitionMode(bool enableOTAMode) {
   return;
 }
 
-// The number of web socket listeners has changed. Update the WiFi scan mode.
+// Identify the peer on the other end of a socket. This is helpful when keeping
+// track of web sockets, as the combination of handle and fd often gets re-used.
+// This shouldn't be an issue as we carefully track the life-cycle of WebSockets
+// by monitoring control messages; but better add the peer as another
+// disambiguation.
+static uint16_t peerPort(int fd) {
+  struct sockaddr_in6 in;
+  socklen_t len = sizeof(in);
+  return getpeername(fd, (sockaddr*)&in, &len) ? -1 : ntohs(in.sin6_port);
+}
+
+// We start WiFi scanning a little while after we have been asked to do so. That
+// gives the network stack time to quiet down and decreases the chances of us
+// losing network packets while actively scanning.
+static void wifiScannerJob(void*) {
+  wifi_scan_config_t cfg{.show_hidden{true},
+                         .scan_type{WIFI_SCAN_TYPE_ACTIVE},
+                         .scan_time{.active{.max{150}}},
+                         .home_chan_dwell_time{250}};
+  esp_wifi_scan_start(&cfg, false);
+  return;
+}
+
+// There was a change to the active WebSocket sessions or there we have received
+// all WiFi scan results. Either option might require us to start/stop scanning
+// for WiFi access points.
 static void wifiScanner() {
-  const bool hasListeners = !!wsSessions.size();
+  bool hasListeners = false;
+  // If at least one WebSocket session has responded to our previous scan
+  // results and is now waiting for more, we can resume scanning.
+  for (auto it = wsSessions.begin(); it != wsSessions.end(); ++it)
+    if (it->second) {
+      hasListeners = true;
+      break;
+    }
+  // Check whether anything has changed from when we were called last.
   if (wifiScanning != hasListeners) {
     wifiScanning = hasListeners;
+    static esp_timer_handle_t timer{0};
     if (wifiScanning) {
-      wifi_scan_config_t cfg{.show_hidden{false},
-                             .scan_type{WIFI_SCAN_TYPE_ACTIVE},
-                             .scan_time{.active{.max{100}}},
-                             .home_chan_dwell_time{250}};
-      esp_wifi_scan_start(&cfg, false);
-    } else
+      // Create a timer to invoke WiFi scanning with a short delay.
+      if (!timer) {
+        esp_timer_create_args_t args{.callback{wifiScannerJob},
+                                     .dispatch_method{ESP_TIMER_TASK},
+                                     .name{"wifi-scan"}};
+
+        ESP_ERROR_CHECK(esp_timer_create(&args, &timer));
+      }
+      // If we weren't scanning yet, (re)start the timer.
+      esp_timer_start_once(timer, 100 * 1000);
+    } else {
+      // Stop the timer, if it hasn't gone off yet. Then stop the scan.
+      if (timer) esp_timer_stop(timer);
       esp_wifi_scan_stop();
+    }
   }
+  return;
+}
+
+// When the WiFi scan is completed, reap the results, broadcast to listeners,
+// and see if we need to restart scanning.
+template <typename T>
+struct CaseInsensitiveLess {
+  bool operator()(T lhs, T rhs) const {
+    return strcasecmp((char*)lhs.data(), (char*)rhs.data()) < 0;
+  }
+};
+static void wifiScanDone() {
+  uint16_t num;
+  wifi_ap_record_t* records = NULL;
+  if (esp_wifi_scan_get_ap_num(&num) == ESP_OK) {
+    // We have to allocate enough space to hold all search results. But
+    // even if the allocation fails, we must call
+    // esp_wifi_scan_get_ap_records() to clean up resources. Error
+    // handling is tricky here. Setting the number of records to zero, if we
+    // fail to allocate a buffer ensures that we still clean up afterwards.
+    if (!(records = (wifi_ap_record_t*)malloc(num * sizeof(*records)))) num = 0;
+    if (esp_wifi_scan_get_ap_records(&num, records) == ESP_OK && num) {
+      // Scan results go into a case-insensitive cache that slowly expires old
+      // records over time. This neatly deals with access points that only
+      // respond occasionally to our scans.
+      static std::map<
+          std::array<uint8_t, MAX_SSID_LEN + 1>, uint8_t,
+          CaseInsensitiveLess<std::array<uint8_t, MAX_SSID_LEN + 1> > >
+          ssids;
+      // Since are sending data asynchronously to all the listening WebSockets,
+      // we have to dynamically allocate memory to keep track of our state. This
+      // includes but is not limited to the payload that we are sending over the
+      // WebSocket(s). And of course, we don't know the size of the payload
+      // until we have iterated over the scan results, so allocation is delayed
+      // until then.
+      size_t dataLen{0};
+      struct State {
+        httpd_ws_frame_t wsPacket;
+        int outstanding;
+        char payload[];
+      }* state{NULL};
+      // Clean up our state once the last outstanding asynchronous messages
+      // has been sent. We initialize "state->outstanding" to one, in order to
+      // avoid possible race conditions.
+      auto cleanup = [](esp_err_t err, int fd, void* arg) {
+        auto& state = *(State*)arg;
+        if (err != ESP_OK) {
+          auto peer = peerPort(fd);
+          // We currently only have a single HTTPD server instance, but in the
+          // interest of generality, scan the active WebSocket sessions to find
+          // the server that is associated with a given file descriptor.
+          for (auto it = wsSessions.begin(); it != wsSessions.end(); ++it) {
+            if (it->first.fd == fd && it->first.peer == peer) {
+              // Error sending message on WebSocket. Close it now.
+              httpd_handle_t hd{it->first.hd};
+              wsSessions.erase(it);
+              httpd_sess_trigger_close(hd, fd);
+              break;
+            }
+          }
+        }
+        // Clean up our dynamically allocated state.
+        if (!--state.outstanding) free(arg);
+      };
+#ifdef __EXCEPTIONS
+      try {
+#endif
+        static uint8_t generation{0};
+        generation++;
+        for (int i = 0; i < num; ++i)
+          if (*records[i].ssid)
+            ssids[std::to_array(records[i].ssid)] = generation;
+        for (auto it = ssids.begin(); it != ssids.end();) {
+          // We do eventually remove stale WiFi access points when they
+          // no longer show up in scans. But since scans are notoriously
+          // unreliable, we err on the side of caching old data for
+          // quite a while.
+          if (generation - it->second > 30)
+            it = ssids.erase(it);
+          else
+            dataLen += 1 + strlen((char*)it++->first.data());
+        }
+        state = (State*)calloc(1, sizeof(State) + dataLen);
+        if (state) {
+          auto& wsPacket{state->wsPacket};
+          wsPacket.type = HTTPD_WS_TYPE_TEXT;
+          wsPacket.len = dataLen;
+          wsPacket.payload = (uint8_t*)&state[1];
+          state->outstanding = 1;
+          char* ptr{state->payload};
+
+          // Assemble payload of WebSocket message.
+          for (auto it = ssids.begin(); it != ssids.end(); ++it) {
+            ptr += 1 + strlen(strcpy(ptr, (char*)it->first.data()));
+          }
+          // Sending a message on a web socket can trigger events that
+          // end up marking the session as closed. This can cause us to
+          // modify the "wsSessions" map concurrently with iterating
+          // over it. Create a copy of the map first and then verify
+          // that the global map still contains our session before
+          // operating on it.
+          auto cpy{wsSessions};
+          for (auto it = cpy.begin(); it != cpy.end(); ++it) {
+            decltype(wsSessions)::iterator sess;
+            // Only send a message, if the WebSocket hasn't previously been
+            // closed, and only if it has acknowledged our previous message.
+            if (it->second && peerPort(it->first.fd) == it->first.peer &&
+                (sess = wsSessions.find(it->first)) != wsSessions.end()) {
+              // Mark WebSocket as responded. We won't initiate another
+              // scan until the HTML client tells us to. This slows things
+              // down, but it helps with reliability when changing radio
+              // frequencies during a WiFi scan.
+              sess->second = false;
+              state->outstanding++;
+              if (httpd_ws_send_data_async(it->first.hd, it->first.fd,
+                                           &wsPacket, cleanup,
+                                           state) != ESP_OK) {
+                // Failed to enqueue message. Close that WebSocket.
+                state->outstanding--;
+                wsSessions.erase(sess);
+                httpd_sess_trigger_close(it->first.hd, it->first.fd);
+              }
+            }
+          }
+        }
+#ifdef __EXCEPTIONS
+      } catch (const std::bad_alloc&) {
+        ssids.clear();
+      }
+#endif
+      // If we never sent any messages, we now clean up our dynamically
+      // allocated state. Otherwise, that will happen when the last message
+      // has finished sending.
+      cleanup(ESP_OK, -1, state);
+    }
+  }
+  free(records);
+  wifiScanning = false;
+  wifiScanner();
   return;
 }
 
@@ -354,18 +545,19 @@ static esp_err_t redirectHandler(httpd_req_t* req, const char* path = "") {
                        &buf[sizeof(buf) - 16], 16),
              path);
     httpd_resp_set_hdr(req, "Location", buf);
+    ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "Redirecting to \"%s\"", buf);
   }
   return httpd_resp_send(req, NULL, 0);
 }
 
-// We asked the web socket subsystem to send us control messages. That means, we
-// are now responsible to actually respond to them.
+// We asked the web socket subsystem to send us control messages. That means,
+// we are now responsible to actually respond to them.
 static esp_err_t maybeHandleWSCtrl(httpd_req_t* req,
-                                   httpd_ws_type_t* type = 0,
-                                   char** buf = 0,
-                                   size_t* len = 0) {
-  // Check if this is even web socket connection in the first place. The caller
-  // shouldn't have called us otherwise.
+                                   httpd_ws_type_t* type = NULL,
+                                   char** buf = NULL,
+                                   size_t* len = NULL) {
+  // Check if this is even web socket connection in the first place. The
+  // caller shouldn't have called us otherwise.
   if (buf) *buf = NULL;
   if (len) *len = 0;
   if (type) *type = (httpd_ws_type_t)-1;
@@ -381,8 +573,10 @@ static esp_err_t maybeHandleWSCtrl(httpd_req_t* req,
   if (wsPacket.len > 0) {
     wsPacket.payload = (uint8_t*)malloc(wsPacket.len + 1);
     if (!wsPacket.payload) return ESP_ERR_NO_MEM;
+
     rc = httpd_ws_recv_frame(req, &wsPacket, wsPacket.len);
     if (rc < 0) goto done;
+
     wsPacket.payload[wsPacket.len] = '\0';
   }
   if (type) *type = wsPacket.type;
@@ -397,7 +591,12 @@ static esp_err_t maybeHandleWSCtrl(httpd_req_t* req,
     respond:
       rc = httpd_ws_send_frame(req, &wsPacket);
       break;
+    case HTTPD_WS_TYPE_BINARY:
+    case HTTPD_WS_TYPE_TEXT:
+      break;
     default:
+      ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
+               "Unexpected WebSocket control message %d", wsPacket.type);
       break;
   }
   if (buf && len) {
@@ -423,7 +622,8 @@ static esp_err_t cfgHttpHandler(httpd_req_t* req) {
 #ifdef __EXCEPTIONS
       try {
 #endif
-        wsSessions[req->handle] = httpd_req_to_sockfd(req);
+        int fd = httpd_req_to_sockfd(req);
+        wsSessions[WSState{req->handle, fd, peerPort(fd)}] = true;
 #ifdef __EXCEPTIONS
       } catch (const std::bad_alloc&) {
         wsSessions.clear();
@@ -459,55 +659,33 @@ static esp_err_t cfgHttpHandler(httpd_req_t* req) {
   char* buf;
   size_t len;
   auto rc = maybeHandleWSCtrl(req, &type, &buf, &len);
+  if (rc != ESP_OK) {
+    int fd = httpd_req_to_sockfd(req);
+    wsSessions.erase(WSState{req->handle, fd, peerPort(fd)});
+    httpd_sess_trigger_close(req->handle, fd);
+  }
+  int fd = httpd_req_to_sockfd(req);
   switch (type) {
     case HTTPD_WS_TYPE_CLOSE:
-      wsSessions.erase(req->handle);
+      wsSessions.erase(WSState{req->handle, fd, peerPort(fd)});
       wifiScanner();
       break;
     case HTTPD_WS_TYPE_TEXT:
     case HTTPD_WS_TYPE_BINARY:
+      // Received an acknowledgement from the web client. We can resume
+      // scanning.
+      for (auto it = wsSessions.begin(); it != wsSessions.end(); ++it)
+        if (it->first.hd == req->handle && it->first.fd == fd) {
+          it->second = true;
+          break;
+        }
+      wifiScanner();
       break;
     default:
       break;
   }
   free(buf);
   return rc;
-}
-
-// Immediately reset all requests arriving on port 443. That's good enough to
-// make browsers give up on automatically upgrading captive portals to HTTPS.
-static void reset443(void* arg) {
-  auto ap = (esp_netif_t*)arg;
-  for (int sock;;) {
-    for (;;) {
-      // Try opening the socket until it succeeds.
-      sock = socket(AF_INET, SOCK_STREAM, 0);
-      if (sock >= 0) break;
-      vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    // Only listen on the IP address of the SoftAP. It shouldn't ever
-    // change at run-time, but just to be on the safe side, we reload the
-    // IP address if every time. For now, we only support IPv4, though.
-    esp_netif_ip_info_t info;
-    esp_netif_get_ip_info(ap, &info);
-    sockaddr_in httpsAddr{
-        .sin_len{sizeof(httpsAddr)},
-        .sin_family{AF_INET},
-        .sin_port{htons(443)},
-        .sin_addr{info.ip.addr},
-    };
-    // If we can't listen on the interface, try again later. Maybe, the SoftAP
-    // is (re)intializing.
-    if (bind(sock, (sockaddr*)&httpsAddr, sizeof(httpsAddr)) < 0) {
-    err:
-      close(sock);
-      continue;
-    }
-    for (int fd;;) {
-      if (listen(sock, 5) || (fd = accept(sock, 0, 0)) < 0) goto err;
-      close(fd);
-    }
-  }
 }
 
 // Return static files in response to HTTP requests or handle web socket
@@ -551,14 +729,50 @@ static esp_err_t httpHandler(httpd_req_t* req) {
   // There are several conditions that make us display the main app, and a
   // few that make us display the configuration GUI. Of course, all of this is
   // moot, if there isn't even a main app registered.
-  if ((appEnabled || !onSoftAP || forceApp) && !forceCfg)
-    if (mainAppHttpHandler) {
-      // We asked the web socket subsystem to send us control messages. This
-      // means we are responsible for implementing them. The main application
-      // might not know how to do so, though.
-      return mainAppHttpHandler(req);
-    }
+  if ((appEnabled || !onSoftAP || forceApp) && !forceCfg &&
+      mainAppHttpHandler) {
+    // We asked the web socket subsystem to send us control messages. This
+    // means we are responsible for implementing them. The main application
+    // might not know how to do so, though.
+    return mainAppHttpHandler(req);
+  }
   return cfgHttpHandler(req);
+}
+
+// Immediately reset all requests arriving on port 443. That's good enough to
+// make browsers give up on automatically upgrading captive portals to HTTPS.
+static void reset443(void* arg) {
+  auto ap = (esp_netif_t*)arg;
+  for (int sock;;) {
+    for (;;) {
+      // Try opening the socket until it succeeds.
+      sock = socket(AF_INET, SOCK_STREAM, 0);
+      if (sock >= 0) break;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    // Only listen on the IP address of the SoftAP. It shouldn't ever
+    // change at run-time, but just to be on the safe side, we reload the
+    // IP address if every time. For now, we only support IPv4, though.
+    esp_netif_ip_info_t info;
+    esp_netif_get_ip_info(ap, &info);
+    sockaddr_in httpsAddr{
+        .sin_len{sizeof(httpsAddr)},
+        .sin_family{AF_INET},
+        .sin_port{htons(443)},
+        .sin_addr{info.ip.addr},
+    };
+    // If we can't listen on the interface, try again later. Maybe, the SoftAP
+    // is (re)intializing.
+    if (bind(sock, (sockaddr*)&httpsAddr, sizeof(httpsAddr)) < 0) {
+    err:
+      close(sock);
+      continue;
+    }
+    for (int fd;;) {
+      if (listen(sock, 5) || (fd = accept(sock, 0, 0)) < 0) goto err;
+      close(fd);
+    }
+  }
 }
 
 // Initialize the webserver. This creates both a regular web server for
@@ -576,7 +790,7 @@ static void initHTTPD(NetworkState* state) {
   cfg.uri_match_fn = matchAll;
   cfg.enable_so_linger = true;
   cfg.close_fn = [](httpd_handle_t hd, int fd) {
-    wsSessions.erase(hd);
+    wsSessions.erase(WSState{hd, fd, peerPort(fd)});
     close(fd);
     wifiScanner();
   };
@@ -757,82 +971,15 @@ static void captivePortalDNS(void* arg) {
 // essentially the continuation of what initNetwork() does, and it performs a
 // few additional initializations that had to wait for the WiFi subsystem to
 // fully come up asynchronously.
-template <typename T>
-struct CaseInsensitiveLess {
-  bool operator()(T lhs, T rhs) const {
-    return strcasecmp((char*)lhs.data(), (char*)rhs.data()) < 0;
-  }
-};
 static void wifiEventHandler(void* arg,
                              esp_event_base_t eventBase,
                              int32_t eventId,
                              void* eventData) {
   const auto& state = *(NetworkState*)arg;
   if (eventBase == WIFI_EVENT) switch (eventId) {
-      case WIFI_EVENT_SCAN_DONE: {
-        uint16_t num;
-        wifi_ap_record_t* records = NULL;
-        if (esp_wifi_scan_get_ap_num(&num) == ESP_OK) {
-          // We have to allocate enough space to hold all search results. But
-          // even if the allocation fails, we must call
-          // esp_wifi_scan_get_ap_records() to clean up resources. Error
-          // handling is tricky here.
-          if (!(records = (wifi_ap_record_t*)malloc(num * sizeof(*records))))
-            num = 0;
-          if (esp_wifi_scan_get_ap_records(&num, records) == ESP_OK && num) {
-            static std::map<
-                std::array<uint8_t, MAX_SSID_LEN + 1>, uint8_t,
-                CaseInsensitiveLess<std::array<uint8_t, MAX_SSID_LEN + 1> > >
-                ssids;
-            httpd_ws_frame_t wsPacket = {.type{HTTPD_WS_TYPE_TEXT}, .len{0}};
-#ifdef __EXCEPTIONS
-            try {
-#endif
-              static uint8_t generation{0};
-              generation++;
-              for (int i = 0; i < num; ++i)
-                if (*records[i].ssid)
-                  ssids[std::to_array(records[i].ssid)] = generation;
-              for (auto it = ssids.begin(); it != ssids.end();) {
-                // We do eventually remove stale WiFi access points when they
-                // no longer show up in scans. But since scans are notoriously
-                // unreliable, we err on the side of caching old data for
-                // quite a while.
-                if (generation - it->second > 10)
-                  it = ssids.erase(it);
-                else
-                  wsPacket.len += 1 + strlen((char*)it++->first.data());
-              }
-              if (!!(wsPacket.payload = (uint8_t*)malloc(wsPacket.len))) {
-                auto ptr = (char*)wsPacket.payload;
-                for (auto it = ssids.begin(); it != ssids.end(); ++it) {
-                  ptr += 1 + strlen(strcpy(ptr, (char*)it->first.data()));
-                }
-                // Sending a message on a web socket can trigger events that
-                // end up marking the session as closed. This can cause us to
-                // modify the "wsSessions" map concurrently with iterating
-                // over it. Create a copy of the map first and then verify
-                // that the global map still contains our session before
-                // operating on it.
-                auto cpy{wsSessions};
-                for (auto it = cpy.begin(); it != cpy.end(); ++it) {
-                  const auto old = wsSessions.find(it->first);
-                  if (old != wsSessions.end() && old->second == it->second)
-                    httpd_ws_send_data(it->first, it->second, &wsPacket);
-                }
-              }
-#ifdef __EXCEPTIONS
-            } catch (const std::bad_alloc&) {
-              ssids.clear();
-            }
-#endif
-            free(wsPacket.payload);
-          }
-        }
-        free(records);
-        wifiScanning = false;
-        wifiScanner();
-      } break;
+      case WIFI_EVENT_SCAN_DONE:
+        wifiScanDone();
+        break;
       case WIFI_EVENT_STA_START:
         esp_wifi_connect();
         break;
@@ -851,12 +998,12 @@ static void wifiEventHandler(void* arg,
       case WIFI_EVENT_AP_STACONNECTED:
       case WIFI_EVENT_AP_STADISCONNECTED: {
         // The ESP32 only has a single radio. This means, while scanning for
-        // WiFi networks to connect to in STA mode, it can't reliably maintain
-        // connections in AP mode. As a work-around, we leave APSTA mode in
-        // favor of plain AP mode, whenever somebody is connected to our
-        // SoftAP. On the other hand, if there is a working WiFi connection in
-        // both WiFi modes, no need to stop APSTA, as we aren't expected to
-        // start scanning.
+        // WiFi networks to connect to in STA mode, it can't reliably
+        // maintain connections in AP mode. As a work-around, we leave APSTA
+        // mode in favor of plain AP mode, whenever somebody is connected to
+        // our SoftAP. On the other hand, if there is a working WiFi
+        // connection in both WiFi modes, no need to stop APSTA, as we
+        // aren't expected to start scanning.
         wifi_mode_t mode{};
         wifi_sta_list_t sta{};
         wifi_ap_record_t ap{};
@@ -912,9 +1059,9 @@ static void initNetwork() {
   return;
 }
 
-// Non-volatile storage must be initialized if using WiFi. Conveniently, we
-// can also store WiFi credentials and all sort of other settings in NVS
-// storage. It's just a general-purpose key-value store.
+// Non-volatile storage must be initialized if using WiFi. Conveniently,
+// we can also store WiFi credentials and all sort of other settings in
+// NVS storage. It's just a general-purpose key-value store.
 static void initNVS() {
   const auto initStatus = nvs_flash_init();
   if (initStatus == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -922,8 +1069,8 @@ static void initNVS() {
     nvs_flash_erase();
     nvs_flash_init();
   }
-  // If the user previously provided us with WiFi credentials, we can use them
-  // to turn on STA mode.
+  // If the user previously provided us with WiFi credentials, we can
+  // use them to turn on STA mode.
   nvs_handle_t hd = 0;
   auto& ssid = wifiStaConfig.sta.ssid;
   auto& pswd = wifiStaConfig.sta.password;
@@ -934,9 +1081,9 @@ static void initNVS() {
       nvs_get_blob(hd, "pswd", (char*)&pswd, &pswdSz) == ESP_OK) {
     ssid[ssidSz] = pswd[pswdSz] = '\000';
   }
-  // We store a unique identifier in NVS. This is derived from the main MAC
-  // (which is not guaranteed to be unique), and from the limited amount of
-  // true randomness that we collected during boot up.
+  // We store a unique identifier in NVS. This is derived from the main
+  // MAC (which is not guaranteed to be unique), and from the limited
+  // amount of true randomness that we collected during boot up.
   uint8_t uniqueId[16];
   auto uniqueSz = sizeof(uniqueId);
   if (nvs_get_blob(hd, "uniq", (char*)&uniqueId, &uniqueSz) != ESP_OK) {
@@ -949,8 +1096,9 @@ static void initNVS() {
     esp_rom_md5_final(uniqueId, &md5ctx);
     nvs_set_blob(hd, "uniq", (char*)uniqueId, uniqueSz);
     nvs_commit(hd);
-    // While we collected 16 bytes of unique identifier, we only use the first
-    // six in places such as the host name and the name of the SoftAP.
+    // While we collected 16 bytes of unique identifier, we only use the
+    // first six in places such as the host name and the name of the
+    // SoftAP.
     ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
              "Unique ID: %02X %02X %02X %02X %02X %02X", uniqueId[0],
              uniqueId[1], uniqueId[2], uniqueId[3], uniqueId[4], uniqueId[5]);
@@ -967,9 +1115,9 @@ static void initNVS() {
 
 extern "C" void app_main() {
   // Check if we are running from an unnecessarily large application
-  // partition. If so, shrink it now and then reboot. This would happen after
-  // the very first time, that new firmware has been flashed or after a
-  // successful OTA update.
+  // partition. If so, shrink it now and then reboot. This would happen
+  // after the very first time, that new firmware has been flashed or
+  // after a successful OTA update.
   if (!inTestAppPartition()) switchPartitionMode(false);
 
   // Enable WiFi network.
@@ -977,29 +1125,29 @@ extern "C" void app_main() {
   initNetwork();
 
   if (!inTestAppPartition()) {
-    // If our partition table is currently not optimal and allocates too much
-    // space for the factory application, resize partition sizes now and
-    // reboot. This also recreates the data partition after an OTA update has
-    // wiped it.
+    // If our partition table is currently not optimal and allocates too
+    // much space for the factory application, resize partition sizes
+    // now and reboot. This also recreates the data partition after an
+    // OTA update has wiped it.
     switchPartitionMode(false);
-    // For the purposes of this demo, we keep track of iterations in the RTC
-    // RAM area. We go through exactly one cycle of a simulated OTA.
+    // For the purposes of this demo, we keep track of iterations in the
+    // RTC RAM area. We go through exactly one cycle of a simulated OTA.
     if (!((bootloader_params_t*)&bootloader_common_get_rtc_retain_mem()->custom)
              ->_[0]++) {
-      // In order to perform an OTA, we must move our application out of the
-      // way. We temporarily move it into the data partion, which gets wiped
-      // in the process.
+      // In order to perform an OTA, we must move our application out of
+      // the way. We temporarily move it into the data partion, which
+      // gets wiped in the process.
       ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
                "An OTA is available. Move ourselves out of the way");
       switchPartitionMode(true);
     }
   } else {
-    // We just successfully completed an OTA and are running in the temporary
-    // copy. That's not a good long-term thing to do. Reboot back into the
-    // (presumably updated) factory image.
-    ESP_LOGI(
-        CONFIG_LWIP_LOCAL_HOSTNAME,
-        "We just started in simulated OTA mode; rebooting to factory mode");
+    // We just successfully completed an OTA and are running in the
+    // temporary copy. That's not a good long-term thing to do. Reboot
+    // back into the (presumably updated) factory image.
+    ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
+             "We just started in simulated OTA mode; rebooting to "
+             "factory mode");
     reboot();
   }
   return;
