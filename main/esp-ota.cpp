@@ -376,12 +376,135 @@ static void wifiScanner() {
 
 // When the WiFi scan is completed, reap the results, broadcast to listeners,
 // and see if we need to restart scanning.
-template <typename T>
-struct CaseInsensitiveLess {
-  bool operator()(T lhs, T rhs) const {
-    return strcasecmp((char*)lhs.data(), (char*)rhs.data()) < 0;
+class SSIDs {
+public:
+  esp_err_t addToCache(const uint8_t (&ssid)[MAX_SSID_LEN + 1], bool open) {
+#ifdef __EXCEPTIONS
+    try {
+#endif
+      cache_[std::to_array(ssid)] = std::make_pair(generation_, open);
+#ifdef __EXCEPTIONS
+    } catch (const std::bad_alloc&) {
+      cache_.clear();
+      return ESP_ERR_NO_MEM;
+    }
+#endif
+    return ESP_OK;
   }
+
+  void* assembleWSPacket(bool nextGeneration) {
+    auto dataLen = spaceNeeded();
+    if (!dataLen) return NULL;
+    auto state = (SSIDState*)calloc(1, sizeof(SSIDState) + dataLen);
+    if (!state) return NULL;
+    if (nextGeneration) ++generation_;
+
+    auto& wsPacket{state->wsPacket};
+    wsPacket.type = HTTPD_WS_TYPE_TEXT;
+    wsPacket.len = dataLen;
+    wsPacket.payload = (uint8_t*)&state[1];
+    state->outstanding = 1;
+    char* ptr{state->payload};
+
+    // Assemble payload of WebSocket message.
+    for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+      if (it->second.second /* Open WiFi network*/) *ptr++ = '\1';
+      ptr += 1 + strlen(strcpy(ptr, (char*)it->first.data()));
+    }
+
+    return state;
+  }
+
+  static void sendWSMessage(void* arg, decltype(wsSessions)::iterator sess) {
+    if (!arg) return;
+    auto& state = *(SSIDState*)arg;
+    // Mark WebSocket as responded. We won't initiate another
+    // scan until the HTML client tells us to. This slows things
+    // down, but it helps with reliability when changing radio
+    // frequencies during a WiFi scan.
+    sess->second = false;
+    state.outstanding++;
+    auto rc = httpd_ws_send_data_async(sess->first.hd, sess->first.fd,
+                                       &state.wsPacket, cleanupState, arg);
+    if (rc != ESP_OK) cleanupState(rc, sess->first.fd, arg);
+  }
+
+  static void cleanup(void* arg) { cleanupState(ESP_OK, -1, arg); }
+
+private:
+  size_t spaceNeeded() {
+    size_t dataLen{0};
+    for (auto it = cache_.begin(); it != cache_.end();) {
+      // We do eventually remove stale WiFi access points when they
+      // no longer show up in scans. But since scans are notoriously
+      // unreliable, we err on the side of caching old data for
+      // quite a while.
+      if ((int8_t)(generation_ - it->second.first) > 30)
+        it = cache_.erase(it);
+      else {
+        if (it->second.second /* Open WiFi network*/) dataLen++;
+        dataLen += 1 + strlen((char*)it++->first.data());
+      }
+    }
+    return dataLen;
+  }
+
+  // Clean up our state once the last outstanding asynchronous messages
+  // has been sent. We initialize "state->outstanding" to one, in order to
+  // avoid possible race conditions.
+  static void cleanupState(esp_err_t err, int fd, void* arg) {
+    auto& state = *(SSIDState*)arg;
+    if (err != ESP_OK) {
+      auto peer = peerPort(fd);
+      // We currently only have a single HTTPD server instance, but in the
+      // interest of generality, scan the active WebSocket sessions to find
+      // the server that is associated with a given file descriptor.
+      for (auto it = wsSessions.begin(); it != wsSessions.end(); ++it) {
+        if (it->first.fd == fd && it->first.peer == peer) {
+          // Error sending message on WebSocket. Close it now.
+          httpd_handle_t hd{it->first.hd};
+          wsSessions.erase(it);
+          httpd_sess_trigger_close(hd, fd);
+          break;
+        }
+      }
+    }
+    // Clean up our dynamically allocated state.
+    if (arg && !--state.outstanding) free(arg);
+    return;
+  }
+
+  // Scan results go into a case-insensitive cache that slowly expires old
+  // records over time. This neatly deals with access points that only
+  // respond occasionally to our scans.
+  template <typename T>
+  struct CaseInsensitiveLess {
+    bool operator()(T lhs, T rhs) const {
+      return strcasecmp((char*)lhs.data(), (char*)rhs.data()) < 0;
+    }
+  };
+  std::map<std::array<uint8_t, MAX_SSID_LEN + 1>,
+           std::pair<uint8_t, bool>,
+           CaseInsensitiveLess<std::array<uint8_t, MAX_SSID_LEN + 1> > >
+      cache_;
+
+  // Since are sending data asynchronously to all the listening WebSockets,
+  // we have to dynamically allocate memory to keep track of our state. This
+  // includes but is not limited to the payload that we are sending over the
+  // WebSocket(s). And of course, we don't know the size of the payload
+  // until we have iterated over the scan results, so allocation is delayed
+  // until then.
+  struct SSIDState {
+    httpd_ws_frame_t wsPacket;
+    int outstanding;
+    char payload[];
+  };
+
+  // Increment a generation counter on each completed WiFi scan.
+  uint8_t generation_{0};
 };
+static SSIDs ssids;
+
 static void wifiScanDone() {
   uint16_t num;
   wifi_ap_record_t* records = NULL;
@@ -393,89 +516,21 @@ static void wifiScanDone() {
     // fail to allocate a buffer ensures that we still clean up afterwards.
     if (!(records = (wifi_ap_record_t*)malloc(num * sizeof(*records)))) num = 0;
     if (esp_wifi_scan_get_ap_records(&num, records) == ESP_OK && num) {
-      // Scan results go into a case-insensitive cache that slowly expires old
-      // records over time. This neatly deals with access points that only
-      // respond occasionally to our scans.
-      static std::map<
-          std::array<uint8_t, MAX_SSID_LEN + 1>, std::pair<uint8_t, bool>,
-          CaseInsensitiveLess<std::array<uint8_t, MAX_SSID_LEN + 1> > >
-          ssids;
-      // Since are sending data asynchronously to all the listening WebSockets,
-      // we have to dynamically allocate memory to keep track of our state. This
-      // includes but is not limited to the payload that we are sending over the
-      // WebSocket(s). And of course, we don't know the size of the payload
-      // until we have iterated over the scan results, so allocation is delayed
-      // until then.
-      size_t dataLen{0};
-      struct State {
-        httpd_ws_frame_t wsPacket;
-        int outstanding;
-        char payload[];
-      }* state{NULL};
-      // Clean up our state once the last outstanding asynchronous messages
-      // has been sent. We initialize "state->outstanding" to one, in order to
-      // avoid possible race conditions.
-      auto cleanup = [](esp_err_t err, int fd, void* arg) {
-        auto& state = *(State*)arg;
-        if (err != ESP_OK) {
-          auto peer = peerPort(fd);
-          // We currently only have a single HTTPD server instance, but in the
-          // interest of generality, scan the active WebSocket sessions to find
-          // the server that is associated with a given file descriptor.
-          for (auto it = wsSessions.begin(); it != wsSessions.end(); ++it) {
-            if (it->first.fd == fd && it->first.peer == peer) {
-              // Error sending message on WebSocket. Close it now.
-              httpd_handle_t hd{it->first.hd};
-              wsSessions.erase(it);
-              httpd_sess_trigger_close(hd, fd);
-              break;
-            }
-          }
-        }
-        // Clean up our dynamically allocated state.
-        if (!--state.outstanding) free(arg);
-      };
+      for (int i = 0; i < num; ++i)
+        if (*records[i].ssid)
+          ssids.addToCache(records[i].ssid,
+                           records[i].authmode == WIFI_AUTH_OPEN);
+      auto state = ssids.assembleWSPacket(true);
+      if (state) {
+        // Sending a message on a web socket can trigger events that
+        // end up marking the session as closed. This can cause us to
+        // modify the "wsSessions" map concurrently with iterating
+        // over it. Create a copy of the map first and then verify
+        // that the global map still contains our session before
+        // operating on it.
 #ifdef __EXCEPTIONS
-      try {
+        try {
 #endif
-        static uint8_t generation{0};
-        generation++;
-        for (int i = 0; i < num; ++i)
-          if (*records[i].ssid)
-            ssids[std::to_array(records[i].ssid)] = std::make_pair(
-                generation, records[i].authmode == WIFI_AUTH_OPEN);
-        for (auto it = ssids.begin(); it != ssids.end();) {
-          // We do eventually remove stale WiFi access points when they
-          // no longer show up in scans. But since scans are notoriously
-          // unreliable, we err on the side of caching old data for
-          // quite a while.
-          if ((int8_t)(generation - it->second.first) > 30)
-            it = ssids.erase(it);
-          else {
-            if (it->second.second /* Open WiFi network*/) dataLen++;
-            dataLen += 1 + strlen((char*)it++->first.data());
-          }
-        }
-        state = (State*)calloc(1, sizeof(State) + dataLen);
-        if (state) {
-          auto& wsPacket{state->wsPacket};
-          wsPacket.type = HTTPD_WS_TYPE_TEXT;
-          wsPacket.len = dataLen;
-          wsPacket.payload = (uint8_t*)&state[1];
-          state->outstanding = 1;
-          char* ptr{state->payload};
-
-          // Assemble payload of WebSocket message.
-          for (auto it = ssids.begin(); it != ssids.end(); ++it) {
-            if (it->second.second /* Open WiFi network*/) *ptr++ = '\1';
-            ptr += 1 + strlen(strcpy(ptr, (char*)it->first.data()));
-          }
-          // Sending a message on a web socket can trigger events that
-          // end up marking the session as closed. This can cause us to
-          // modify the "wsSessions" map concurrently with iterating
-          // over it. Create a copy of the map first and then verify
-          // that the global map still contains our session before
-          // operating on it.
           auto cpy{wsSessions};
           for (auto it = cpy.begin(); it != cpy.end(); ++it) {
             decltype(wsSessions)::iterator sess;
@@ -483,32 +538,19 @@ static void wifiScanDone() {
             // closed, and only if it has acknowledged our previous message.
             if (it->second && peerPort(it->first.fd) == it->first.peer &&
                 (sess = wsSessions.find(it->first)) != wsSessions.end()) {
-              // Mark WebSocket as responded. We won't initiate another
-              // scan until the HTML client tells us to. This slows things
-              // down, but it helps with reliability when changing radio
-              // frequencies during a WiFi scan.
-              sess->second = false;
-              state->outstanding++;
-              if (httpd_ws_send_data_async(it->first.hd, it->first.fd,
-                                           &wsPacket, cleanup,
-                                           state) != ESP_OK) {
-                // Failed to enqueue message. Close that WebSocket.
-                state->outstanding--;
-                wsSessions.erase(sess);
-                httpd_sess_trigger_close(it->first.hd, it->first.fd);
-              }
+              ssids.sendWSMessage(state, sess);
             }
-          }
-        }
 #ifdef __EXCEPTIONS
-      } catch (const std::bad_alloc&) {
-        ssids.clear();
-      }
+          }
+          catch (const std::bad_alloc&) {
+          }
 #endif
+        }
+      }
       // If we never sent any messages, we now clean up our dynamically
       // allocated state. Otherwise, that will happen when the last message
       // has finished sending.
-      cleanup(ESP_OK, -1, state);
+      ssids.cleanup(state);
     }
   }
   free(records);
@@ -627,7 +669,13 @@ static esp_err_t cfgHttpHandler(httpd_req_t* req) {
       try {
 #endif
         int fd = httpd_req_to_sockfd(req);
-        wsSessions[WSState{req->handle, fd, peerPort(fd)}] = true;
+        auto ins = wsSessions.insert(
+            std::make_pair(WSState{req->handle, fd, peerPort(fd)}, true));
+        // If we already have a cached list of access points, we can reply
+        // immediately. If not, we'll initiate a fresh scan.
+        auto state = ssids.assembleWSPacket(false);
+        ssids.sendWSMessage(state, ins.first);
+        ssids.cleanup(state);
 #ifdef __EXCEPTIONS
       } catch (const std::bad_alloc&) {
         wsSessions.clear();
