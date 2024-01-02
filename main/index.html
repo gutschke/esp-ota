@@ -194,8 +194,10 @@
       join[0].disabled = join[1].disabled = !cst && cred;
       // If the user has filled out some of the information for an unlisted WiFi
       // access point, disable entry on all the scanned access points.
-      for (let i = 1; i < ul.childElementCount; ++i)
-        ul.children[i].children[1].disabled = cred && !ul.children[i].children[1].value;
+      for (let i = 1; i < ul.childElementCount; ++i) {
+        li = ul.children[i].children[1];
+        li.disabled = cred && !(li.type == 'password' && li.value);
+      }
       document.getElementById('joinWifi').disabled = !cred;
     }
 
@@ -206,9 +208,10 @@
       for (el of document.getElementById('wifi').children) {
         let id = el.firstElementChild; // SPAN containing password
         let edit = id.firstElementChild; // null or INPUT
-        ssid = edit ? edit.type == 'password' ? edit.value : '' : id.innerText;
-        let pw = el.children[1].value; // INPUT password field
-        if ((edit ? ssid : pw) != '') {
+        ssid = edit ? edit.value : id.innerText;
+        let pw = el.children[1];
+        pw = pw.type == 'password' && pw.value; // INPUT password field or false
+        if (edit ? ssid : pw) {
           return [ssid, pw];
         }
       }
