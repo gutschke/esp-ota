@@ -159,20 +159,21 @@
     function updateWiFiList(ssids) {
       if (!ssids) return;
       let ul = document.getElementById('wifi');
-      let i = 0, j = 1;
-      while (i < ssids.length || j < ul.childElementCount) {
-        // The SSIDs are in alphabetical order, this allows us walk through both SSIDs
-        // as received from the web socket, and existing labels as part of the DOM.
-        // While walking both lists, we insert or delete as necessary. This approach
-        // ensures that even if the user is currently editing a password field, the
-        // cursor won't disappear. At worst, things shuffle around a little bit.
-        let ssid = i < ssids.length ? ssids[i] : undefined;
+      // The list received from the web socket starts at index zero, whereas the UL
+      // starts as index one. The very first child is always the free-form entry
+      // unlisted WiFi networks.
+      for (let i = 1; i <= ssids.length || i < ul.childElementCount; ) {
+        // The SSIDs are in alphabetical order, this allows us to walk through both
+        // SSIDs as received from the web socket, and existing labels as part of the
+        // DOM. While walking both lists, we insert or delete as necessary. This
+        // approach ensures that even if the user is currently editing a password field,
+        // the cursor won't disappear. At worst, things shuffle around a little bit.
+        let ssid = ssids[i - 1];
         let openWifi = ssid && ssid.startsWith('\1');
         if (openWifi) ssid = ssid.substring(1);
-        let li = ul.childNodes[j];
-        let label = li && li.childElementCount ? li.firstElementChild.textContent : undefined;
-        if (j == ul.childElementCount ||
-            (ssid && label && ssid.toLowerCase() < label.toLowerCase())) {
+        let li = ul.childNodes[i];
+        let label = li && li.firstElementChild.textContent;
+        if (i >= ul.childElementCount || (ssid && ssid.toLowerCase() < label.toLowerCase())) {
           let el = document.createElement('LI');
           el.innerHTML = '<span></span>' +
             (openWifi ? '<input type="button" value="Open WiFi network" class="open"/>'
@@ -180,18 +181,10 @@
           el.firstElementChild.textContent = ssid;
           // The DOM API makes it a little awkward to insert a child at an arbitrary
           // position. We need a special case for insertion at the end.
-          if (li)
-            ul.insertBefore(el, li);
-          else
-            ul.appendChild(el);
+          (li ? ul.insertBefore : ul.appendChild).apply(ul, [ el, li ]);
           el.oninput = wifiInputEvent;
-          j++;
-        } else if (ssid == label) {
-          j++;
-        } else {
-          ul.removeChild(li);
-        }
-        i++;
+        } else if (ssid == label) i++;
+        else ul.removeChild(li);
       }
       let join = document.getElementsByClassName('join');
       let cst = !!(join[0].value || join[1].value);
@@ -207,12 +200,15 @@
     }
 
     function getCredentials() {
+      // Returns SSID and password that the user entered. This can either be
+      // part of a auto-detected network or information manually entered by the
+      // user.
       for (el of document.getElementById('wifi').children) {
         let id = el.firstElementChild; // SPAN containing password
         let edit = id.firstElementChild; // null or INPUT
-        ssid = edit ? edit.value : id.innerText;
+        ssid = edit ? edit.type == 'password' ? edit.value : '' : id.innerText;
         let pw = el.children[1].value; // INPUT password field
-        if ((edit ? ssid : pw) != "") {
+        if ((edit ? ssid : pw) != '') {
           return [ssid, pw];
         }
       }
