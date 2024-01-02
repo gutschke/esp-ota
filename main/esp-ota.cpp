@@ -379,6 +379,13 @@ static void wifiScanner() {
 class SSIDs {
 public:
   esp_err_t addToCache(const uint8_t (&ssid)[MAX_SSID_LEN + 1], bool open) {
+    // Common usage scenarios for these device would have lots of them in the
+    // same location. None are connected to the internet through their SoftAP.
+    // So, filter those out during scanning.
+    if (open && ssid[sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) - 1] == '-' &&
+        !memcmp(ssid, CONFIG_LWIP_LOCAL_HOSTNAME,
+                sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) - 1))
+      return ESP_OK;
 #ifdef __EXCEPTIONS
     try {
 #endif
