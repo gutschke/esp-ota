@@ -49,14 +49,14 @@ static bool wifiScanning{false};
 static wifi_config_t wifiStaConfig{
     .sta{.scan_method{WIFI_ALL_CHANNEL_SCAN},
          .threshold{.authmode{WIFI_AUTH_WPA_PSK}},
-         .pmf_cfg = {.capable{true}, .required{false}}},
+         .pmf_cfg{.capable{true}, .required{false}}},
 };
 static wifi_config_t wifiApConfig{
-    .ap = {.ssid{CONFIG_LWIP_LOCAL_HOSTNAME},
-           .ssid_len{strlen(CONFIG_LWIP_LOCAL_HOSTNAME)},
-           .channel{1},
-           .authmode{WIFI_AUTH_OPEN},
-           .max_connection{2}}};
+    .ap{.ssid{CONFIG_LWIP_LOCAL_HOSTNAME},
+        .ssid_len{strlen(CONFIG_LWIP_LOCAL_HOSTNAME)},
+        .channel{1},
+        .authmode{WIFI_AUTH_OPEN},
+        .max_connection{2}}};
 
 // The standard boot loader implements a relatively rigid policy for
 // determining the boot partition. We extended it so that we can boot
@@ -65,8 +65,8 @@ static wifi_config_t wifiApConfig{
 // follow the default boot order, which prefers the "factory" image
 // unless it is damaged. In that case, it executes the "test" image.
 static void reboot(uint32_t target = FACTORY_INDEX) {
-  bootloader_params_t* params =
-      (bootloader_params_t*)&bootloader_common_get_rtc_retain_mem()->custom;
+  auto params{
+      (bootloader_params_t*)&bootloader_common_get_rtc_retain_mem()->custom};
   params->partition_index = target;
   esp_deep_sleep(1000 /* 1 ms */);
 }
@@ -75,9 +75,9 @@ static void reboot(uint32_t target = FACTORY_INDEX) {
 // Check whether we are running in that partition or instead in the
 // regular "factory" partition.
 static bool inTestAppPartition() {
-  auto me = spi_flash_cache2phys((void*)inTestAppPartition);
-  auto part = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
-                                       ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+  auto me{spi_flash_cache2phys((void*)inTestAppPartition)};
+  auto part{esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                     ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL)};
   return me < part->address || me >= part->address + part->size;
 }
 
@@ -93,8 +93,8 @@ static void switchPartitionMode(bool enableOTAMode) {
   // Stack space is precious. Allocate memory from the heap instead when
   // reading larger amounts of data from flash, such as the 3kB partition
   // table.
-  std::unique_ptr<esp_partition_info_t[]> partitions(
-      new (std::nothrow) esp_partition_info_t[ESP_PARTITION_TABLE_MAX_ENTRIES]);
+  std::unique_ptr<esp_partition_info_t[]> partitions{
+      new (std::nothrow) esp_partition_info_t[ESP_PARTITION_TABLE_MAX_ENTRIES]};
   assert(partitions);
   ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "Reading partition table from 0x%x",
            CONFIG_PARTITION_TABLE_OFFSET);
@@ -106,10 +106,10 @@ static void switchPartitionMode(bool enableOTAMode) {
   // intended, the last two partitions must be a "factory" partition followed
   // by the main "data" partition (e.g. a SPIFFS image) or alternatively
   // a "test" partition while in OTA mode.
-  int8_t appIdx = -1, dataOrTestIdx = -1;
-  bool inOTAMode = false;
+  int8_t appIdx{-1}, dataOrTestIdx{-1};
+  bool inOTAMode{false};
   for (auto i = 0; i < ESP_PARTITION_TABLE_MAX_ENTRIES; ++i) {
-    const esp_partition_info_t& entry = partitions[i];
+    const auto& entry{partitions[i]};
     if (entry.magic == ESP_PARTITION_MAGIC) {
 #if CONFIG_LOG_DEFAULT_LEVEL != LOG_LEVEL_NONE
       // Print the current partion table for debugging purposes.
@@ -126,7 +126,7 @@ static void switchPartitionMode(bool enableOTAMode) {
           entry.subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
         assert(appIdx == -1);
         assert(dataOrTestIdx == -1);
-        const auto me = spi_flash_cache2phys((void*)switchPartitionMode);
+        const auto me{spi_flash_cache2phys((void*)switchPartitionMode)};
         inOTAMode = me >= entry.pos.offset + entry.pos.size;
         appIdx = i;
       } else if ((entry.type == ESP_PARTITION_TYPE_APP &&
@@ -143,7 +143,7 @@ static void switchPartitionMode(bool enableOTAMode) {
       // removed though. There shouldn't be any scenario allowing us to
       // boot into our application with an incorrect signature.
       assert(dataOrTestIdx == i - 1);
-      const uint8_t* digest = (uint8_t*)&entry + 16;
+      const auto digest{(uint8_t*)&entry + 16};
       char buf[50];
       for (int i = 0; i < 16; ++i)
         sprintf(&buf[3 * i], "%02X ", digest[i]);
@@ -186,14 +186,14 @@ static void switchPartitionMode(bool enableOTAMode) {
   // it. This requires iterating over the flash information and finding all
   // headers for the various segments mapped into memory.
   esp_image_header_t app;
-  auto appOffset = partitions[appIdx].pos.offset;
+  auto appOffset{partitions[appIdx].pos.offset};
   ESP_ERROR_CHECK(esp_flash_read(NULL, &app, appOffset, sizeof(app)));
   if (app.magic != ESP_IMAGE_HEADER_MAGIC) {
     ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "Application image header is corrupt");
   } else {
     // The image size is the total of the image header, all combined segment
     // headers, and the data in each segment.
-    auto offset = sizeof(app);
+    auto offset{sizeof(app)};
     for (int i = 0; i < app.segment_count; ++i) {
       esp_image_segment_header_t segment;
       ESP_ERROR_CHECK(
@@ -210,26 +210,26 @@ static void switchPartitionMode(bool enableOTAMode) {
              offset);
     // The optimal size for our partition is the size of the image rounded up
     // to 64kB.
-    size_t appSz = (offset + 0xFFFF) & ~0xFFFF;
+    auto appSz{(offset + 0xFFFF) & ~0xFFFF};
     // In production mode, the optimal application size is the same as the
     // properly padded size of the image. In OTA mode, the application
     // should take up as much space as possible, leaving just enough room at
     // the top of the flash for the "test" partition.
     uint32_t flashSz;
     ESP_ERROR_CHECK(esp_flash_get_physical_size(NULL, &flashSz));
-    size_t optimalSz = enableOTAMode ? flashSz - appOffset - appSz : appSz;
+    auto optimalSz{enableOTAMode ? flashSz - appOffset - appSz : appSz};
     // The data partition takes up the remainder of the flash memory.
-    size_t dataOrTestSz = flashSz - optimalSz - appOffset;
+    auto dataOrTestSz{flashSz - optimalSz - appOffset};
     // ESP32-IDF tries oh so hard to prevent us from overwriting the
     // partition table. What a valiant effort, but its struggles as all things
     // are ultimately doomed to failure. It is no match for our grit,
     // determination, and sheer brute force. If nothing else works, we
     // simply define our own flash chip.
-    auto rw = *esp_flash_default_chip;
-    auto os_func = *rw.os_func;
+    auto rw{*esp_flash_default_chip};
+    auto os_func{*rw.os_func};
     os_func.region_protected = [](void*, size_t, size_t) { return ESP_OK; };
     rw.os_func = &os_func;
-    const auto sectorSz = esp_flash_default_chip->chip_drv->sector_size;
+    const auto sectorSz{esp_flash_default_chip->chip_drv->sector_size};
     // If we want to perform an OTA update momentarily, we have to make sure we
     // execute code from somewhere other than where we are going to write.
     // Temporarily, relocate ourselves to the data partition, overwritting
@@ -239,7 +239,7 @@ static void switchPartitionMode(bool enableOTAMode) {
                "Relocate ourselves into the test partition");
       ESP_ERROR_CHECK(esp_flash_erase_region(&rw, appOffset + appSz,
                                              flashSz - appOffset - appSz));
-      std::unique_ptr<char[]> sector(new (std::nothrow) char[sectorSz]);
+      std::unique_ptr<char[]> sector{new (std::nothrow) char[sectorSz]};
       assert(sector);
       for (size_t offset = 0; offset < appSz; offset += sectorSz) {
         ESP_ERROR_CHECK(
@@ -322,7 +322,7 @@ static void switchPartitionMode(bool enableOTAMode) {
 // disambiguation.
 static uint16_t peerPort(int fd) {
   struct sockaddr_in6 in;
-  socklen_t len = sizeof(in);
+  socklen_t len{sizeof(in)};
   return getpeername(fd, (sockaddr*)&in, &len) ? -1 : ntohs(in.sin6_port);
 }
 
@@ -342,7 +342,7 @@ static void wifiScannerJob(void*) {
 // all WiFi scan results. Either option might require us to start/stop scanning
 // for WiFi access points.
 static void wifiScanner() {
-  bool hasListeners = false;
+  bool hasListeners{false};
   // If at least one WebSocket session has responded to our previous scan
   // results and is now waiting for more, we can resume scanning.
   for (auto it = wsSessions.begin(); it != wsSessions.end(); ++it)
@@ -353,7 +353,7 @@ static void wifiScanner() {
   // Check whether anything has changed from when we were called last.
   if (wifiScanning != hasListeners) {
     wifiScanning = hasListeners;
-    static esp_timer_handle_t timer{0};
+    static esp_timer_handle_t timer{};
     if (wifiScanning) {
       // Create a timer to invoke WiFi scanning with a short delay.
       if (!timer) {
@@ -400,7 +400,7 @@ public:
   }
 
   void* assembleWSPacket(bool nextGeneration) {
-    auto dataLen = spaceNeeded();
+    auto dataLen{spaceNeeded()};
     if (!dataLen) return NULL;
     auto state = (SSIDState*)calloc(1, sizeof(SSIDState) + dataLen);
     if (!state) return NULL;
@@ -424,7 +424,7 @@ public:
 
   static void sendWSMessage(void* arg, decltype(wsSessions)::iterator sess) {
     if (!arg) return;
-    auto& state = *(SSIDState*)arg;
+    auto& state{*(SSIDState*)arg};
     // Mark WebSocket as responded. We won't initiate another
     // scan until the HTML client tells us to. This slows things
     // down, but it helps with reliability when changing radio
@@ -440,7 +440,7 @@ public:
 
 private:
   size_t spaceNeeded() {
-    size_t dataLen{0};
+    size_t dataLen{};
     for (auto it = cache_.begin(); it != cache_.end();) {
       // We do eventually remove stale WiFi access points when they
       // no longer show up in scans. But since scans are notoriously
@@ -460,9 +460,9 @@ private:
   // has been sent. We initialize "state->outstanding" to one, in order to
   // avoid possible race conditions.
   static void cleanupState(esp_err_t err, int fd, void* arg) {
-    auto& state = *(SSIDState*)arg;
+    auto& state{*(SSIDState*)arg};
     if (err != ESP_OK) {
-      auto peer = peerPort(fd);
+      auto peer{peerPort(fd)};
       // We currently only have a single HTTPD server instance, but in the
       // interest of generality, scan the active WebSocket sessions to find
       // the server that is associated with a given file descriptor.
@@ -508,13 +508,13 @@ private:
   };
 
   // Increment a generation counter on each completed WiFi scan.
-  uint8_t generation_{0};
+  uint8_t generation_{};
 };
 static SSIDs ssids;
 
 static void wifiScanDone() {
   uint16_t num;
-  wifi_ap_record_t* records = NULL;
+  wifi_ap_record_t* records{};
   if (esp_wifi_scan_get_ap_num(&num) == ESP_OK) {
     // We have to allocate enough space to hold all search results. But
     // even if the allocation fails, we must call
@@ -527,7 +527,7 @@ static void wifiScanDone() {
         if (*records[i].ssid)
           ssids.addToCache(records[i].ssid,
                            records[i].authmode == WIFI_AUTH_OPEN);
-      auto state = ssids.assembleWSPacket(true);
+      auto state{ssids.assembleWSPacket(true)};
       if (state) {
         // Sending a message on a web socket can trigger events that
         // end up marking the session as closed. This can cause us to
@@ -570,11 +570,11 @@ static void wifiScanDone() {
 // configuration GUI, or whether our HTTP server is operating in STA mode. In
 // that case, we don't expose the configuration interface.
 static bool clientConnectedToAP(httpd_req_t* req) {
-  auto fd = httpd_req_to_sockfd(req);
+  auto fd{httpd_req_to_sockfd(req)};
   sockaddr_in6 in;
-  socklen_t inLen = sizeof(in);
+  socklen_t inLen{sizeof(in)};
   if (!getsockname(fd, (sockaddr*)&in, &inLen)) {
-    auto ap = ((NetworkState*)req->user_ctx)->ap;
+    auto ap{((NetworkState*)req->user_ctx)->ap};
     esp_netif_ip_info_t info;
     esp_netif_get_ip_info(ap, &info);
     return !memcmp(&info.ip.addr, &in.sin6_addr.un.u32_addr[3],
@@ -588,9 +588,9 @@ static bool clientConnectedToAP(httpd_req_t* req) {
 static esp_err_t redirectHandler(httpd_req_t* req, const char* path = "") {
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_status(req, "301 Moved Permanently");
-  auto fd = httpd_req_to_sockfd(req);
+  auto fd{httpd_req_to_sockfd(req)};
   sockaddr_in6 in;
-  socklen_t len = sizeof(in);
+  socklen_t len{sizeof(in)};
   if (!getsockname(fd, (sockaddr*)&in, &len)) {
     char buf[40 + sizeof(CONFIG_LWIP_LOCAL_HOSTNAME)];
     snprintf(buf, sizeof(buf), "http://%s/%s",
@@ -618,8 +618,8 @@ static esp_err_t maybeHandleWSCtrl(httpd_req_t* req,
     return ESP_ERR_INVALID_STATE;
   }
   // Prepare to load the web socket payload;
-  httpd_ws_frame_t wsPacket = {.type = HTTPD_WS_TYPE_TEXT};
-  auto rc = httpd_ws_recv_frame(req, &wsPacket, 0);
+  httpd_ws_frame_t wsPacket{.type{HTTPD_WS_TYPE_TEXT}};
+  auto rc{httpd_ws_recv_frame(req, &wsPacket, 0)};
   if (rc < 0) return rc;
 
   // Knowing the payload length, we can try to retrieve the data.
@@ -669,18 +669,18 @@ static esp_err_t cfgHttpHandler(httpd_req_t* req) {
     // If this is an HTTP connection in the process of being upgraded to a web
     // socket connection, we shouldn't try to return any data for the request.
     // It's just going to mess up the web socket.
-    auto rc =
-        httpd_req_get_hdr_value_str(req, "Sec-WebSocket-Protocol", NULL, 0);
+    auto rc{
+        httpd_req_get_hdr_value_str(req, "Sec-WebSocket-Protocol", NULL, 0)};
     if (rc == ESP_OK || rc == ESP_ERR_HTTPD_RESULT_TRUNC) {
 #ifdef __EXCEPTIONS
       try {
 #endif
-        int fd = httpd_req_to_sockfd(req);
-        auto ins = wsSessions.insert(
-            std::make_pair(WSState{req->handle, fd, peerPort(fd)}, true));
+        auto fd{httpd_req_to_sockfd(req)};
+        auto ins{wsSessions.insert(
+            std::make_pair(WSState{req->handle, fd, peerPort(fd)}, true))};
         // If we already have a cached list of access points, we can reply
         // immediately. If not, we'll initiate a fresh scan.
-        auto state = ssids.assembleWSPacket(false);
+        auto state{ssids.assembleWSPacket(false)};
         ssids.sendWSMessage(state, ins.first);
         ssids.cleanup(state);
 #ifdef __EXCEPTIONS
@@ -696,7 +696,7 @@ static esp_err_t cfgHttpHandler(httpd_req_t* req) {
     static const struct {
       const char *path, *mimeType, *data;
       const size_t len;
-    } files[] = {
+    } files[]{
         // Add more embedded static files here. Try to minimize the number of
         // active HTTP requests though. Our network stack and the HTTP server
         // have very small resource limits. This means, instead of referencing
@@ -717,13 +717,13 @@ static esp_err_t cfgHttpHandler(httpd_req_t* req) {
   httpd_ws_type_t type;
   char* buf;
   size_t len;
-  auto rc = maybeHandleWSCtrl(req, &type, &buf, &len);
+  auto rc{maybeHandleWSCtrl(req, &type, &buf, &len)};
   if (rc != ESP_OK) {
     int fd = httpd_req_to_sockfd(req);
     wsSessions.erase(WSState{req->handle, fd, peerPort(fd)});
     httpd_sess_trigger_close(req->handle, fd);
   }
-  int fd = httpd_req_to_sockfd(req);
+  int fd{httpd_req_to_sockfd(req)};
   switch (type) {
     case HTTPD_WS_TYPE_CLOSE:
       wsSessions.erase(WSState{req->handle, fd, peerPort(fd)});
@@ -759,11 +759,11 @@ static esp_err_t httpHandler(httpd_req_t* req) {
   // configuration GUI and will then become accessible at the root URI until
   // power-cycled. The special URIs "/${APP}-cfg" and "/${APP}-app" are
   // always available to by-pass this automated mechanism.
-  bool forceApp = false, forceCfg = false;
-  const auto uri = req->uri;
+  bool forceApp{false}, forceCfg{false};
+  const auto uri{req->uri};
   if (*uri == '/' && !memcmp(uri + 1, CONFIG_LWIP_LOCAL_HOSTNAME,
                              sizeof(CONFIG_LWIP_LOCAL_HOSTNAME))) {
-    size_t removeCount = sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) - 1;
+    auto removeCount{sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) - 1};
     if (!memcmp(&uri[sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) + 1], "-app", 4)) {
       removeCount += sizeof("-app") - 1;
       forceApp = true;
@@ -777,13 +777,13 @@ static esp_err_t httpHandler(httpd_req_t* req) {
               strlen(&uri[removeCount + 1]) + 1);
     }
   }
-  bool onSoftAP = clientConnectedToAP(req);
+  bool onSoftAP{clientConnectedToAP(req)};
   // If accessing through the SoftAP (which defaults to showing the
   // configuration GUI upon power on), permanently switch to the main
   // application the first time it gets access. This can be reset by power
   // cycling. Or of course, the user can always explicitly decide to go to
   // "${APP}-app".
-  static bool appEnabled = false;
+  static bool appEnabled{false};
   appEnabled |= onSoftAP && forceApp;
   // There are several conditions that make us display the main app, and a
   // few that make us display the configuration GUI. Of course, all of this is
@@ -801,7 +801,7 @@ static esp_err_t httpHandler(httpd_req_t* req) {
 // Immediately reset all requests arriving on port 443. That's good enough to
 // make browsers give up on automatically upgrading captive portals to HTTPS.
 static void reset443(void* arg) {
-  auto ap = (esp_netif_t*)arg;
+  auto ap{(esp_netif_t*)arg};
   for (int sock;;) {
     for (;;) {
       // Try opening the socket until it succeeds.
@@ -844,7 +844,7 @@ static void reset443(void* arg) {
 // certificates anyway. That doesn't help much, and it really doesn't help
 // with captive portals.
 static void initHTTPD(NetworkState* state) {
-  const auto matchAll = [](const char*, const char*, size_t) { return true; };
+  const auto matchAll{[](const char*, const char*, size_t) { return true; }};
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.uri_match_fn = matchAll;
   cfg.enable_so_linger = true;
@@ -853,15 +853,15 @@ static void initHTTPD(NetworkState* state) {
     close(fd);
     wifiScanner();
   };
-  httpd_handle_t httpServer = NULL;
+  httpd_handle_t httpServer{};
   if (!httpd_start(&httpServer, &cfg)) {
-    httpd_uri_t handler{.uri = "",
-                        .method = HTTP_GET,
-                        .handler = httpHandler,
-                        .user_ctx = state,
-                        .is_websocket = true,
-                        .handle_ws_control_frames = true,
-                        .supported_subprotocol = "cfg"};
+    httpd_uri_t handler{.uri{""},
+                        .method{HTTP_GET},
+                        .handler{httpHandler},
+                        .user_ctx{state},
+                        .is_websocket{true},
+                        .handle_ws_control_frames{true},
+                        .supported_subprotocol{"cfg"}};
     httpd_register_uri_handler(httpServer, &handler);
   }
   const auto alwaysRedirect = [](httpd_req* req, httpd_err_code_t err) {
@@ -881,7 +881,7 @@ void dhcpsPostAppendOpts(netif* netif,
                          dhcps_t* dhcps,
                          uint8_t state,
                          uint8_t** pp_opts) {
-  auto captive = *pp_opts;
+  auto captive{*pp_opts};
   captive[0] = 114;
   sprintf((char*)captive + 2, "http://%s/", inet_ntoa(netif->ip_addr));
   captive[1] = strlen((char*)captive + 2);
@@ -893,7 +893,7 @@ void dhcpsPostAppendOpts(netif* netif,
 // ever respond to queries for A records and then always return the
 // IP address of the SoftAP.
 static void captivePortalDNS(void* arg) {
-  auto ap = (esp_netif_t*)arg;
+  auto ap{(esp_netif_t*)arg};
   // The DNS server never terminates. If it encounters any unexpected
   // failure conditions, it closes the socket and then restarts itself.
   for (int sock;;) {
@@ -928,18 +928,9 @@ static void captivePortalDNS(void* arg) {
     for (;;) {
       typedef struct {
         uint16_t id;
-        unsigned rd : 1;
-        unsigned tc : 1;
-        unsigned aa : 1;
-        unsigned op : 4;
-        unsigned qr : 1;
-        unsigned rcode : 4;
-        unsigned z : 3;
-        unsigned ra : 1;
-        uint16_t qdcount;
-        uint16_t ancount;
-        uint16_t nscount;
-        uint16_t arcount;
+        unsigned rd : 1, tc : 1, aa : 1, op : 4, qr : 1;
+        unsigned rcode : 4, z : 3, ra : 1;
+        uint16_t qdcount, ancount, nscount, arcount;
       } Header;
       sockaddr_in from{};
       socklen_t fromLen{sizeof(from)};
@@ -950,7 +941,7 @@ static void captivePortalDNS(void* arg) {
                           &fromLen)) > 0 &&
           fromLen == sizeof(from)) {
         if (len <= sizeof(Header)) continue;
-        auto& header = *(Header*)&req[0];
+        auto& header{*(Header*)&req[0]};
         // We only handle packets that contain queries and that aren't
         // truncated. If the packet doesn't meet these requirements, ignore
         // it. There isn't even a need to send an error response for these
@@ -965,7 +956,7 @@ static void captivePortalDNS(void* arg) {
         // single query and those don't really compress. But we still perform
         // some minimal parsing. Fortunately, full decompression isn't
         // required.
-        uint8_t *in = &req[sizeof(Header)], *nxt = 0;
+        uint8_t *in{&req[sizeof(Header)]}, *nxt{};
         while (in >= req && in < &req[len]) {
           if (!*in) {
             if (in < &req[len - 1]) nxt = in + 1;
@@ -982,7 +973,7 @@ static void captivePortalDNS(void* arg) {
         header.qr = 1;
         header.aa = 1;
         header.ra = header.rd;
-        uint16_t respLen = len;
+        auto respLen{(uint16_t)len};
         // We can only handle the most basic queries for a single A record.
         if (header.op || header.qdcount != htons(1)) {
           // If there is anything wrong or unexpected, send an error message.
@@ -1034,7 +1025,7 @@ static void wifiEventHandler(void* arg,
                              esp_event_base_t eventBase,
                              int32_t eventId,
                              void* eventData) {
-  const auto& state = *(NetworkState*)arg;
+  const auto& state{*(NetworkState*)arg};
   if (eventBase == WIFI_EVENT) switch (eventId) {
       case WIFI_EVENT_SCAN_DONE:
         wifiScanDone();
@@ -1048,7 +1039,7 @@ static void wifiEventHandler(void* arg,
           esp_wifi_connect();
       } break;
       case WIFI_EVENT_AP_START:
-        static TaskHandle_t handle = 0;
+        static TaskHandle_t handle{};
         if (!handle) {
           xTaskCreate(captivePortalDNS, "captivedns", 4096, state.ap,
                       configMAX_PRIORITIES - 1, &handle);
@@ -1094,7 +1085,7 @@ static void wifiEventHandler(void* arg,
 // already.
 static void initNetwork() {
   static NetworkState state{};
-  bool isSta = !!wifiStaConfig.sta.ssid[0];
+  bool isSta{!!wifiStaConfig.sta.ssid[0]};
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   if (esp_netif_init() != ESP_OK || esp_event_loop_create_default() != ESP_OK ||
       esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
@@ -1122,7 +1113,7 @@ static void initNetwork() {
 // we can also store WiFi credentials and all sort of other settings in
 // NVS storage. It's just a general-purpose key-value store.
 static void initNVS() {
-  const auto initStatus = nvs_flash_init();
+  const auto initStatus{nvs_flash_init()};
   if (initStatus == ESP_ERR_NVS_NO_FREE_PAGES ||
       initStatus == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     nvs_flash_erase();
@@ -1130,11 +1121,11 @@ static void initNVS() {
   }
   // If the user previously provided us with WiFi credentials, we can
   // use them to turn on STA mode.
-  nvs_handle_t hd = 0;
-  auto& ssid = wifiStaConfig.sta.ssid;
-  auto& pswd = wifiStaConfig.sta.password;
-  auto ssidSz = sizeof(ssid) - 1;
-  auto pswdSz = sizeof(pswd) - 1;
+  nvs_handle_t hd{};
+  auto& ssid{wifiStaConfig.sta.ssid};
+  auto& pswd{wifiStaConfig.sta.password};
+  auto ssidSz{sizeof(ssid) - 1};
+  auto pswdSz{sizeof(pswd) - 1};
   if (nvs_open("default", NVS_READWRITE, &hd) == ESP_OK &&
       nvs_get_blob(hd, "ssid", (char*)&ssid, &ssidSz) == ESP_OK &&
       nvs_get_blob(hd, "pswd", (char*)&pswd, &pswdSz) == ESP_OK) {
