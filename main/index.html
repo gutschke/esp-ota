@@ -95,7 +95,7 @@
     }
 
     // Align buttons to the right side of the box.
-    body>div>span {
+    form>span {
       text-align: right;
       width: 100%;
       display: inline-block;
@@ -152,7 +152,12 @@
     let ws = undefined;
     let tmo = undefined;
 
-    function joinWifiCallback() {
+    function joinWifiCallback(e) {
+      ws.send(
+        '\0' + (e.submitter.id == 'joinWifi'
+        ? getCredentials()
+        : [e.submitter.parentElement.firstChild.firstChild.textContent, ''])
+        .join('\0') + '\0');
       return false;
     }
 
@@ -176,7 +181,7 @@
         if (i >= ul.childElementCount || (ssid && ssid.toLowerCase() < label.toLowerCase())) {
           let el = document.createElement('LI');
           el.innerHTML = '<span></span>' +
-            (openWifi ? '<input type="button" value="Open WiFi network" class="open"/>'
+            (openWifi ? '<input type="submit" value="Open WiFi network" class="open"/>'
                       : '<input type="password" placeholder="Password"/>');
           el.firstElementChild.textContent = ssid;
           // The DOM API makes it a little awkward to insert a child at an arbitrary
@@ -196,7 +201,7 @@
       // access point, disable entry on all the scanned access points.
       for (let i = 1; i < ul.childElementCount; ++i) {
         li = ul.children[i].children[1];
-        li.disabled = cred && !(li.type == 'password' && li.value);
+        li.disabled = (cst || cred) && !(li.type == 'password' && li.value);
       }
       document.getElementById('joinWifi').disabled = !cred;
     }
@@ -271,17 +276,19 @@
   <div>
     <h1>Settings</h1>
     <h2>WiFi Networks</h2>
-    <ul id="wifi">
-      <li><span><input placeholder="Join WiFi Network" class="join" /></span><input type="password"
-          placeholder="Password" class="join" /></li>
-    </ul>
-    <span>
-      <form onsubmit="return joinWifiCallback()"><input type="submit" value="Connect" id="joinWifi" disabled /></form>
-    </span>
+    <form onsubmit="return joinWifiCallback(event)">
+      <ul id="wifi">
+        <li><span><input placeholder="Join WiFi Network" class="join" /></span><input type="password"
+            placeholder="Password" class="join" /></li>
+      </ul>
+      <span>
+        <input type="submit" value="Connect" id="joinWifi" disabled />
+      </span>
+    </form>
     <h2>Start Main Application</h2>
-    <span>
+    <form><span>
       <input type="button" value="Start" onclick="location.replace('/${CONFIG_LWIP_LOCAL_HOSTNAME}-app')"/>
-    </span>
+    </span></form>
   </div>
 </body>
 </html>

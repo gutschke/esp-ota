@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -27,11 +28,6 @@
 // UI.
 static esp_err_t (*mainAppHttpHandler)(httpd_req_t* req);
 
-// Pass state from the event handler to the network-related tasks.
-struct NetworkState {
-  esp_netif_t *ap, *sta;
-};
-
 // Notify web socket connections of WiFi scan results.
 struct WSState {
   httpd_handle_t hd;
@@ -45,18 +41,56 @@ struct WSState {
 static std::map<WSState, bool> wsSessions;
 static bool wifiScanning{false};
 
-// Our WiFi settings for both STA (if available) and AP mode.
-static wifi_config_t wifiStaConfig{
-    .sta{.scan_method{WIFI_ALL_CHANNEL_SCAN},
-         .threshold{.authmode{WIFI_AUTH_WPA_PSK}},
-         .pmf_cfg{.capable{true}, .required{false}}},
+// Wrap millisecond timestamps in a class that helps with doing the correct
+// serial number arithmetic when computing timeouts.
+class ms_t {
+public:
+  ms_t() : t(0) {}
+  explicit ms_t(uint32_t x) : t(x) {}
+  explicit ms_t(const ms_t& x) : t((uint32_t)x) {}
+  explicit operator uint32_t() const { return t; }
+  constexpr ms_t& operator=(const ms_t& x) = default;
+
+  // https://en.wikipedia.org/wiki/Serial_number_arithmetic
+  bool operator<(const ms_t& x) { return (int32_t)(t - (uint32_t)x) < 0; }
+  bool operator==(const ms_t& x) { return t == (uint32_t)x; }
+  bool operator!() { return !t; }
+
+  // Return the current time in milliseconds as an unsigned quantity.
+  // Optionally, add a delta for computing a target time for timeouts. Never
+  // returns zero, so that it is easy to distinguish uninitialized values.
+  static ms_t now(uint32_t delta = 0) {
+    const auto us = esp_timer_get_time();
+    uint32_t ms = (uint32_t)((us + 500) / 1000) + delta;
+    return ms_t{ms ? ms : ms + 1};
+  }
+
+  void reset() { t = 0; }
+  bool isExpired() {
+    if (!t) return true;
+    if (now() < *this) return false;
+    t = 0;
+    return true;
+  }
+
+private:
+  uint32_t t;
 };
-static wifi_config_t wifiApConfig{
-    .ap{.ssid{CONFIG_LWIP_LOCAL_HOSTNAME},
-        .ssid_len{strlen(CONFIG_LWIP_LOCAL_HOSTNAME)},
-        .channel{1},
-        .authmode{WIFI_AUTH_OPEN},
-        .max_connection{2}}};
+static ms_t now(uint32_t delta = 0) {
+  return ms_t::now(delta);
+}
+
+// Pass state from the event handler to the network-related tasks.
+struct NetworkState {
+  esp_netif_t *ap, *sta;
+  wifi_ap_config_t apCfg;
+  wifi_sta_config_t staCfg;
+  httpd_handle_t httpServer;
+  enum { DONE, TRYING, STARTING } tryingNewCredentials;
+  uint8_t trySSID[32];
+  uint8_t tryPSWD[64];
+  ms_t blockWiFiReconnectsUntil;
+};
 
 // The standard boot loader implements a relatively rigid policy for
 // determining the boot partition. We extended it so that we can boot
@@ -114,6 +148,7 @@ static void switchPartitionMode(bool enableOTAMode) {
 #if CONFIG_LOG_DEFAULT_LEVEL != LOG_LEVEL_NONE
       // Print the current partion table for debugging purposes.
       char label[sizeof(entry.label) + 1];
+
       memcpy(label, entry.label, sizeof(entry.label));
       label[sizeof(entry.label)] = '\000';
       ESP_LOGI("esp_ota", "%s, %s, %d, 0x%lx, 0x%lx, %s", label,
@@ -334,6 +369,10 @@ static void wifiScannerJob(void*) {
                          .scan_type{WIFI_SCAN_TYPE_ACTIVE},
                          .scan_time{.active{.max{150}}},
                          .home_chan_dwell_time{250}};
+  // We can only scan, if STA is enabled. Turn it on temporarily.
+  wifi_mode_t mode;
+  esp_wifi_get_mode(&mode);
+  if (mode == WIFI_MODE_AP) esp_wifi_set_mode(WIFI_MODE_APSTA);
   esp_wifi_scan_start(&cfg, false);
   return;
 }
@@ -378,7 +417,10 @@ static void wifiScanner() {
 // and see if we need to restart scanning.
 class SSIDs {
 public:
-  esp_err_t addToCache(const uint8_t (&ssid)[MAX_SSID_LEN + 1], bool open) {
+  esp_err_t addToCache(const uint8_t (&ssid)[MAX_SSID_LEN + 1],
+                       uint8_t channel,
+                       int8_t rssi,
+                       bool open) {
     // Common usage scenarios for these device would have lots of them in the
     // same location. None are connected to the internet through their SoftAP.
     // So, filter those out during scanning.
@@ -389,7 +431,18 @@ public:
 #ifdef __EXCEPTIONS
     try {
 #endif
-      cache_[std::to_array(ssid)] = std::make_pair(generation_, open);
+      auto it = cache_.find(std::to_array(ssid));
+      if (it == cache_.end())
+        cache_[std::to_array(ssid)] =
+            CacheEntry{generation_, channel, rssi, open};
+      else {
+        if (it->second.generation != generation_ || it->second.rssi < rssi) {
+          it->second.generation = generation_;
+          it->second.channel = channel;
+          it->second.rssi = rssi;
+          it->second.open = open;
+        }
+      }
 #ifdef __EXCEPTIONS
     } catch (const std::bad_alloc&) {
       cache_.clear();
@@ -415,7 +468,7 @@ public:
 
     // Assemble payload of WebSocket message.
     for (auto it = cache_.begin(); it != cache_.end(); ++it) {
-      if (it->second.second /* Open WiFi network*/) *ptr++ = '\1';
+      if (it->second.open /* Open WiFi network*/) *ptr++ = '\1';
       ptr += 1 + strlen(strcpy(ptr, (char*)it->first.data()));
     }
 
@@ -424,19 +477,30 @@ public:
 
   static void sendWSMessage(void* arg, decltype(wsSessions)::iterator sess) {
     if (!arg) return;
-    auto& state{*(SSIDState*)arg};
+    auto state{(SSIDState*)arg};
     // Mark WebSocket as responded. We won't initiate another
     // scan until the HTML client tells us to. This slows things
     // down, but it helps with reliability when changing radio
     // frequencies during a WiFi scan.
     sess->second = false;
-    state.outstanding++;
+    state->outstanding++;
     auto rc = httpd_ws_send_data_async(sess->first.hd, sess->first.fd,
-                                       &state.wsPacket, cleanupState, arg);
+                                       &state->wsPacket, cleanupState, arg);
     if (rc != ESP_OK) cleanupState(rc, sess->first.fd, arg);
   }
 
   static void cleanup(void* arg) { cleanupState(ESP_OK, -1, arg); }
+
+  uint8_t preferredChannel(const uint8_t* ssid) {
+    std::array<uint8_t, MAX_SSID_LEN + 1> key;
+    auto ptr = memchr(ssid, 0, MAX_SSID_LEN);
+    auto len = ptr ? (uint8_t*)ptr - ssid : MAX_SSID_LEN;
+    memcpy(key.data(), ssid, len);
+    memset(key.data() + len, 0, MAX_SSID_LEN + 1 - len);
+    auto it = cache_.find(key);
+    if (it == cache_.end()) return 0;
+    return it->second.channel;
+  }
 
 private:
   size_t spaceNeeded() {
@@ -446,10 +510,10 @@ private:
       // no longer show up in scans. But since scans are notoriously
       // unreliable, we err on the side of caching old data for
       // quite a while.
-      if ((int8_t)(generation_ - it->second.first) > 30)
+      if ((int8_t)(generation_ - it->second.generation) > 30)
         it = cache_.erase(it);
       else {
-        if (it->second.second /* Open WiFi network*/) dataLen++;
+        if (it->second.open /* Open WiFi network*/) dataLen++;
         dataLen += 1 + strlen((char*)it++->first.data());
       }
     }
@@ -460,7 +524,7 @@ private:
   // has been sent. We initialize "state->outstanding" to one, in order to
   // avoid possible race conditions.
   static void cleanupState(esp_err_t err, int fd, void* arg) {
-    auto& state{*(SSIDState*)arg};
+    auto state{(SSIDState*)arg};
     if (err != ESP_OK) {
       auto peer{peerPort(fd)};
       // We currently only have a single HTTPD server instance, but in the
@@ -477,22 +541,29 @@ private:
       }
     }
     // Clean up our dynamically allocated state.
-    if (arg && !--state.outstanding) free(arg);
+    if (arg && !--state->outstanding) free(arg);
     return;
   }
 
   // Scan results go into a case-insensitive cache that slowly expires old
   // records over time. This neatly deals with access points that only
   // respond occasionally to our scans.
-  template <typename T>
-  struct CaseInsensitiveLess {
-    bool operator()(T lhs, T rhs) const {
+  struct CacheEntry {
+    CacheEntry(uint8_t generation = 0,
+               uint8_t channel = 0,
+               int8_t rssi = 0,
+               bool open = false)
+        : generation(generation), channel(channel), rssi(rssi), open(open) {}
+    uint8_t generation;
+    uint8_t channel;
+    int8_t rssi;
+    bool open;
+    bool operator()(std::array<uint8_t, MAX_SSID_LEN + 1> lhs,
+                    std::array<uint8_t, MAX_SSID_LEN + 1> rhs) const {
       return strcasecmp((char*)lhs.data(), (char*)rhs.data()) < 0;
     }
   };
-  std::map<std::array<uint8_t, MAX_SSID_LEN + 1>,
-           std::pair<uint8_t, bool>,
-           CaseInsensitiveLess<std::array<uint8_t, MAX_SSID_LEN + 1> > >
+  std::map<std::array<uint8_t, MAX_SSID_LEN + 1>, CacheEntry, CacheEntry>
       cache_;
 
   // Since are sending data asynchronously to all the listening WebSockets,
@@ -512,7 +583,7 @@ private:
 };
 static SSIDs ssids;
 
-static void wifiScanDone() {
+static void wifiScanDone(void*) {
   uint16_t num;
   wifi_ap_record_t* records{};
   if (esp_wifi_scan_get_ap_num(&num) == ESP_OK) {
@@ -525,7 +596,7 @@ static void wifiScanDone() {
     if (esp_wifi_scan_get_ap_records(&num, records) == ESP_OK && num) {
       for (int i = 0; i < num; ++i)
         if (*records[i].ssid)
-          ssids.addToCache(records[i].ssid,
+          ssids.addToCache(records[i].ssid, records[i].primary, records[i].rssi,
                            records[i].authmode == WIFI_AUTH_OPEN);
       auto state{ssids.assembleWSPacket(true)};
       if (state) {
@@ -662,6 +733,39 @@ done:
   return rc;
 }
 
+// The user entered new WiFi credentials. Attempt to connect to them in STA
+// mode.
+static wifi_mode_t preferredWiFiMode(NetworkState*, bool);
+static void connectToWifi(NetworkState* state,
+                          const char* ssid,
+                          const char* pswd) {
+  ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "connectToWifi(\"%s\", \"%s\")", ssid,
+           pswd);
+  // wifi_sta_config_t has both an ssid and a password field. These
+  // fields are zero padded up to a maximum length of 32 or 64 bytes
+  // respectively. That means, they are not necessarily zero
+  // terminated.
+  state->tryingNewCredentials = NetworkState::STARTING;
+  memset(state->trySSID, 0, sizeof(state->trySSID));
+  memset(state->tryPSWD, 0, sizeof(state->tryPSWD));
+  memcpy(state->trySSID, ssid, std::min(sizeof(state->trySSID), strlen(ssid)));
+  memcpy(state->tryPSWD, pswd, std::min(sizeof(state->tryPSWD), strlen(pswd)));
+  preferredWiFiMode(state, true);
+  // Disconnecting from WiFi disrupts active WiFi connections. Delay until we
+  // have returned from current HTTP request.
+  httpd_queue_work(
+      state->httpServer,
+      [](void*) {
+        uint16_t aid;
+        if (esp_wifi_sta_get_aid(&aid) == ESP_OK && aid)
+          esp_wifi_disconnect();
+        else
+          esp_wifi_connect();
+      },
+      NULL);
+  return;
+}
+
 // The web server for the configuration GUI supports both GET requests for
 // static embedded files and web socket requests for configuration management.
 static esp_err_t cfgHttpHandler(httpd_req_t* req) {
@@ -731,14 +835,27 @@ static esp_err_t cfgHttpHandler(httpd_req_t* req) {
       break;
     case HTTPD_WS_TYPE_TEXT:
     case HTTPD_WS_TYPE_BINARY:
-      // Received an acknowledgement from the web client. We can resume
-      // scanning.
-      for (auto it = wsSessions.begin(); it != wsSessions.end(); ++it)
-        if (it->first.hd == req->handle && it->first.fd == fd) {
-          it->second = true;
-          break;
+      if (len) {
+        if (*buf == ' ') {
+          // Received an acknowledgement from the web client. We can resume
+          // scanning.
+          for (auto it = wsSessions.begin(); it != wsSessions.end(); ++it)
+            if (it->first.hd == req->handle && it->first.fd == fd) {
+              it->second = true;
+              break;
+            }
+          wifiScanner();
+        } else if (*buf == '\0' && len >= 4) {
+          const auto ssid = buf + 1;
+          auto pswd = (char*)memchr(ssid, 0, len - (ssid - buf));
+          auto state{(NetworkState*)req->user_ctx};
+          if (pswd++ && memchr(pswd, 0, len - (pswd - buf)) &&
+              pswd - ssid - 1 <= sizeof(state->staCfg.ssid) &&
+              strlen(pswd) <= sizeof(state->staCfg.password)) {
+            connectToWifi(state, ssid, pswd);
+          }
         }
-      wifiScanner();
+      }
       break;
     default:
       break;
@@ -801,8 +918,11 @@ static esp_err_t httpHandler(httpd_req_t* req) {
 // Immediately reset all requests arriving on port 443. That's good enough to
 // make browsers give up on automatically upgrading captive portals to HTTPS.
 static void reset443(void* arg) {
-  auto ap{(esp_netif_t*)arg};
+  auto state{(NetworkState*)arg};
   for (int sock;;) {
+    while (!state->ap) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
     for (;;) {
       // Try opening the socket until it succeeds.
       sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -811,9 +931,9 @@ static void reset443(void* arg) {
     }
     // Only listen on the IP address of the SoftAP. It shouldn't ever
     // change at run-time, but just to be on the safe side, we reload the
-    // IP address if every time. For now, we only support IPv4, though.
+    // IP address every time. For now, we only support IPv4, though.
     esp_netif_ip_info_t info;
-    esp_netif_get_ip_info(ap, &info);
+    esp_netif_get_ip_info(state->ap, &info);
     sockaddr_in httpsAddr{
         .sin_len{sizeof(httpsAddr)},
         .sin_family{AF_INET},
@@ -825,6 +945,7 @@ static void reset443(void* arg) {
     if (bind(sock, (sockaddr*)&httpsAddr, sizeof(httpsAddr)) < 0) {
     err:
       close(sock);
+      vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
     for (int fd;;) {
@@ -843,7 +964,7 @@ static void reset443(void* arg) {
 // any way of getting a valid SSL certificate, we'd only be using self-signed
 // certificates anyway. That doesn't help much, and it really doesn't help
 // with captive portals.
-static void initHTTPD(NetworkState* state) {
+static httpd_handle_t initHTTPD(NetworkState* state) {
   const auto matchAll{[](const char*, const char*, size_t) { return true; }};
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.uri_match_fn = matchAll;
@@ -871,9 +992,8 @@ static void initHTTPD(NetworkState* state) {
        err = (httpd_err_code_t)((int)err + 1)) {
     httpd_register_err_handler(httpServer, err, alwaysRedirect);
   }
-  xTaskCreate(reset443, "fakehttps", 2048, state->ap, configMAX_PRIORITIES - 1,
-              0);
-  return;
+  xTaskCreate(reset443, "fakehttps", 2048, &state, configMAX_PRIORITIES - 1, 0);
+  return httpServer;
 }
 
 // Advertise our own IP address as a captive portal in the DHCP response.
@@ -905,7 +1025,7 @@ static void captivePortalDNS(void* arg) {
     }
     // Only listen on the IP address of the SoftAP. It shouldn't ever
     // change at run-time, but just to be on the safe side, we reload the
-    // IP address if every time. For now, we only support IPv4, though.
+    // IP address every time. For now, we only support IPv4, though.
     esp_netif_ip_info_t info;
     esp_netif_get_ip_info(ap, &info);
     sockaddr_in dnsAddr{
@@ -941,13 +1061,13 @@ static void captivePortalDNS(void* arg) {
                           &fromLen)) > 0 &&
           fromLen == sizeof(from)) {
         if (len <= sizeof(Header)) continue;
-        auto& header{*(Header*)&req[0]};
+        auto header{(Header*)&req[0]};
         // We only handle packets that contain queries and that aren't
         // truncated. If the packet doesn't meet these requirements, ignore
         // it. There isn't even a need to send an error response for these
         // unexpected packets.
-        if (header.tc || header.qr || header.ancount || header.nscount ||
-            header.arcount) {
+        if (header->tc || header->qr || header->ancount || header->nscount ||
+            header->arcount) {
           continue;
         }
         // DNS query compression is a useful feature, but it makes skipping
@@ -970,14 +1090,14 @@ static void captivePortalDNS(void* arg) {
         if (!nxt) continue;
         // In our response, we claim to be authoritative for everything
         // and we happily offer to perform (fake) recursive look ups.
-        header.qr = 1;
-        header.aa = 1;
-        header.ra = header.rd;
+        header->qr = 1;
+        header->aa = 1;
+        header->ra = header->rd;
         auto respLen{(uint16_t)len};
         // We can only handle the most basic queries for a single A record.
-        if (header.op || header.qdcount != htons(1)) {
+        if (header->op || header->qdcount != htons(1)) {
           // If there is anything wrong or unexpected, send an error message.
-          header.rcode = 4;
+          header->rcode = 4;
         } else {
           // Check whether this is in fact a request for an A record. Also,
           // verify that there is enough space left in our static buffer to
@@ -987,7 +1107,7 @@ static void captivePortalDNS(void* arg) {
             // If we can't handle this request, don't even try; we know that
             // our server has lots of limitations. Just send an error message
             // back.
-            header.rcode = 4;
+            header->rcode = 4;
           } else {
             // Include the original query and for the response append a
             // pointer to the original host name and an A record referencing
@@ -996,7 +1116,7 @@ static void captivePortalDNS(void* arg) {
             memcpy(&nxt[4], "\xC0\x0C\0\1\0\1\0\0\0\0\0\4", 12);
             memcpy(&nxt[16], &info.ip.addr, 4);
             respLen = &nxt[20] - req;
-            header.ancount = htons(1);
+            header->ancount = htons(1);
           }
         }
         // Send the reply or an error message, in cases when we can't handle
@@ -1017,6 +1137,169 @@ static void captivePortalDNS(void* arg) {
   }
 }
 
+// The hardware only has a single radio. This makes things unreliable if
+// trying to operate both AP and STA at the same time, as AP wants to stay on
+// a single channel, whereas STA might need to switch channels while actively
+// hunting for the base station. We can mitigate a lot of these issues by
+// switching between operating modes based on additional knowledge that we
+// have.
+static wifi_mode_t preferredWiFiMode(NetworkState* state, bool resetSTABlock) {
+  // Access to STA connections can be blocked for a while. Unblock, if the
+  // caller requested us to do so.
+  if (resetSTABlock) {
+    state->blockWiFiReconnectsUntil.reset();
+  }
+  // For now, assume that we always want access to the configuration
+  // interface. A future hardening option might make this configurable.
+  bool enableAP{true}, enableSTA{false};
+  wifi_mode_t mode{};
+  ESP_ERROR_CHECK(esp_wifi_get_mode(&mode));
+  uint16_t aid{};
+  wifi_sta_list_t staList{};
+
+  // Only if we are configured with an SSID (and possibly password) should we
+  // even attempt to enable STA mode. Otherwise, things are easy and we stay
+  // in AP mode. Also, if somebody is currently attached to our configuration
+  // interface, don't attempt switch on STA mode unless explicitly requested.
+  // This can knock user's off the SoftAP.
+  esp_err_t e0{}, e1{};
+  if ((e0 = esp_wifi_ap_get_sta_list(&staList)) != ESP_OK || !staList.num ||
+      ((e1 = esp_wifi_sta_get_aid(&aid)) == ESP_OK && aid) ||
+      state->tryingNewCredentials == NetworkState::STARTING)
+    enableSTA |= (state->staCfg.ssid[0] &&
+                  state->blockWiFiReconnectsUntil.isExpired()) ||
+                 state->tryingNewCredentials != NetworkState::DONE;
+  ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
+           "e0: %d, e1: %d, sta.num: %d, aid: %d, trying: %d, enableSTA: %s",
+           (int)e0, (int)e1, staList.num, (int)aid,
+           (int)state->tryingNewCredentials, enableSTA ? "true" : "false");
+
+// Enable the desired mode. But if both AP and STA are disabled, then at the
+// very least, turn on AP mode. This allows users to connect to the SoftAP to
+// make any necessary configuration changes.
+retry:
+  auto target =
+      enableSTA ? enableAP ? WIFI_MODE_APSTA : WIFI_MODE_STA : WIFI_MODE_AP;
+  if (enableSTA) {
+    // Temporarily override the default SSID/Password, but fall back to the
+    // known-good configuration if we can't connect.
+    wifi_sta_config_t tryCfg{state->staCfg};
+    if (state->tryingNewCredentials != NetworkState::DONE) {
+      memcpy(tryCfg.ssid, state->trySSID, sizeof(state->trySSID));
+      memcpy(tryCfg.password, state->tryPSWD, sizeof(state->tryPSWD));
+    }
+    tryCfg.channel = ssids.preferredChannel(tryCfg.ssid);
+    ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "Preferred channel: %d",
+             tryCfg.channel);
+    esp_wifi_set_mode(target);
+    if ((!state->sta && !(state->sta = esp_netif_create_default_wifi_sta())) ||
+        esp_netif_set_hostname(state->sta, (char*)state->apCfg.ssid) !=
+            ESP_OK ||
+        esp_wifi_set_config(WIFI_IF_STA, (wifi_config_t*)&tryCfg) != ESP_OK) {
+      enableSTA = false;
+      goto retry;
+    }
+  } else
+    esp_wifi_set_mode(target);
+  return target;
+}
+
+// Non-volatile storage must be initialized if using WiFi. Conveniently,
+// we can also store WiFi credentials and all sort of other settings in
+// NVS storage. It's just a general-purpose key-value store.
+static void syncNVS(NetworkState* state, bool update = false) {
+  static auto initStatus{ESP_ERR_NOT_FINISHED};
+  if (initStatus == ESP_ERR_NOT_FINISHED) initStatus = nvs_flash_init();
+  if (initStatus == ESP_ERR_NVS_NO_FREE_PAGES ||
+      initStatus == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    nvs_flash_erase();
+    initStatus = nvs_flash_init();
+  }
+  // We store a unique identifier in NVS. This is derived from the main
+  // MAC (which is not guaranteed to be unique), and from the limited
+  // amount of true randomness that we collected during boot up.
+  // We only need to read this information once.
+  bool pending = false;
+  nvs_handle_t hd{};
+  if (nvs_open("default", NVS_READWRITE, &hd) == ESP_OK) {
+    if (!update) {
+      uint8_t uniqueId[16];
+      auto uniqueSz = sizeof(uniqueId);
+      if (nvs_get_blob(hd, "uniq", (char*)&uniqueId, &uniqueSz) != ESP_OK) {
+        MD5Context md5ctx;
+        esp_rom_md5_init(&md5ctx);
+        esp_fill_random(uniqueId, sizeof(uniqueId));
+        esp_rom_md5_update(&md5ctx, uniqueId, sizeof(uniqueId));
+        esp_efuse_mac_get_default(uniqueId);
+        esp_rom_md5_update(&md5ctx, uniqueId, sizeof(uniqueId));
+        esp_rom_md5_final(uniqueId, &md5ctx);
+        nvs_set_blob(hd, "uniq", (char*)uniqueId, uniqueSz);
+        pending = true;
+      }
+      // While we collected 16 bytes of unique identifier, we only use the
+      // first six in places such as the host name and the name of the
+      // SoftAP.
+      ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
+               "Unique ID: %02X %02X %02X %02X %02X %02X", uniqueId[0],
+               uniqueId[1], uniqueId[2], uniqueId[3], uniqueId[4], uniqueId[5]);
+      snprintf((char*)state->apCfg.ssid + state->apCfg.ssid_len,
+               sizeof(state->apCfg.ssid), "-%02X%02X%02X", uniqueId[0],
+               uniqueId[1], uniqueId[2]);
+      state->apCfg.ssid_len = strlen((char*)state->apCfg.ssid);
+    }
+    // If the user previously provided us with WiFi credentials, we can
+    // use them to turn on STA mode. Please note that wifi_sta_config_t
+    // has ssid and password fields that are zero padded but not
+    // necessarily zero terminated.
+    // If we are updating NVS information (e.g. after the user changed WiFi
+    // credentials) we still read first and then only write in case of a
+    // change in value.
+    uint8_t ssid[sizeof(state->staCfg.ssid) + 1];
+    uint8_t pswd[sizeof(state->staCfg.password) + 1];
+    size_t ssidSz{sizeof(ssid) - 1};
+    size_t pswdSz{sizeof(pswd) - 1};
+    if (nvs_get_blob(hd, "ssid", (char*)&ssid, &ssidSz) == ESP_OK &&
+        nvs_get_blob(hd, "pswd", (char*)&pswd, &pswdSz) == ESP_OK) {
+    } else {
+      // No persistent WiFi credentials found
+      ssidSz = pswdSz = 0;
+    }
+    memset(&ssid[ssidSz], 0, sizeof(ssid) - ssidSz);
+    memset(&pswd[pswdSz], 0, sizeof(pswd) - pswdSz);
+    if (!update) {
+      // Reading credentials from flash into RAM
+      memcpy(state->staCfg.ssid, ssid, sizeof(state->staCfg.ssid));
+      memcpy(state->staCfg.password, pswd, sizeof(state->staCfg.password));
+    } else {
+      // Storing new credentials in NVS. Only update data that has changed. This
+      // minimizes writes to flash.
+      if (memcmp(state->staCfg.ssid, ssid, sizeof(state->staCfg.ssid))) {
+        auto ptr =
+            (uint8_t*)memchr(state->staCfg.ssid, 0, sizeof(state->staCfg.ssid));
+        nvs_set_blob(
+            hd, "ssid", state->staCfg.ssid,
+            ptr ? ptr - state->staCfg.ssid : sizeof(state->staCfg.ssid));
+        pending = true;
+      }
+      if (memcmp(state->staCfg.password, pswd,
+                 sizeof(state->staCfg.password))) {
+        auto ptr = (uint8_t*)memchr(state->staCfg.password, 0,
+                                    sizeof(state->staCfg.password));
+        nvs_set_blob(hd, "pswd", state->staCfg.password,
+                     ptr ? ptr - state->staCfg.password
+                         : sizeof(state->staCfg.password));
+        pending = true;
+      }
+      if (update && pending)
+        ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
+                 "Storing new WiFi credentials in NVS");
+    }
+    if (pending) nvs_commit(hd);
+    nvs_close(hd);
+  }
+  return;
+}
+
 // Handle WiFi events, such as connections coming up and going down. This is
 // essentially the continuation of what initNetwork() does, and it performs a
 // few additional initializations that had to wait for the WiFi subsystem to
@@ -1025,55 +1308,84 @@ static void wifiEventHandler(void* arg,
                              esp_event_base_t eventBase,
                              int32_t eventId,
                              void* eventData) {
-  const auto& state{*(NetworkState*)arg};
+  auto state{(NetworkState*)arg};
   if (eventBase == WIFI_EVENT) switch (eventId) {
       case WIFI_EVENT_SCAN_DONE:
-        wifiScanDone();
+        ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "SCAN_DONE");
+        httpd_queue_work(state->httpServer, wifiScanDone, NULL);
         break;
       case WIFI_EVENT_STA_START:
+        ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "STA_START");
         esp_wifi_connect();
         break;
+      case WIFI_EVENT_STA_CONNECTED:
+        ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "STA_CONNECTED");
+        if (state->tryingNewCredentials != NetworkState::DONE) {
+          memcpy(state->staCfg.ssid, state->trySSID, sizeof(state->trySSID));
+          memcpy(state->staCfg.password, state->tryPSWD,
+                 sizeof(state->tryPSWD));
+          syncNVS(state, true);
+          state->tryingNewCredentials = NetworkState::DONE;
+        }
+        preferredWiFiMode(state, true);
+        break;
       case WIFI_EVENT_STA_DISCONNECTED: {
-        wifi_sta_list_t sta{};
-        if (esp_wifi_ap_get_sta_list(&sta) != ESP_OK || !sta.num)
-          esp_wifi_connect();
+        ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "STA_DISCONNECTED");
+        // Trying to connect in STA mode is very disruptive to any client
+        // connected in AP mode. So, limit how frequently we are actively
+        // trying to connect.
+        static esp_timer_handle_t timer{};
+        if (!timer) {
+          esp_timer_create_args_t args{
+              .callback{[](void* arg) {
+                // If STA scans are no longer blocked, make another attempt to
+                // connect to the base station.
+                auto state = (NetworkState*)arg;
+                auto mode = preferredWiFiMode(state, false);
+                if (mode == WIFI_MODE_APSTA || mode == WIFI_MODE_STA)
+                  esp_wifi_connect();
+              }},
+              .arg{arg},
+              .dispatch_method{ESP_TIMER_TASK},
+              .name{"sta-connect"}};
+          ESP_ERROR_CHECK(esp_timer_create(&args, &timer));
+        }
+        if (state->tryingNewCredentials != NetworkState::DONE) {
+          // If we are actively trying to connect to a new network, do so right
+          // away.
+          auto mode = preferredWiFiMode(state, true);
+          state->tryingNewCredentials =
+              state->tryingNewCredentials == NetworkState::STARTING
+                  ? NetworkState::TRYING
+                  : NetworkState::DONE;
+          if (mode == WIFI_MODE_APSTA || mode == WIFI_MODE_STA)
+            esp_wifi_connect();
+        } else if (!state->blockWiFiReconnectsUntil) {
+          // Otherwise, rate-limit attempts to connect, as we otherwise can't
+          // keep our SoftAP up and running; and if WiFi credentials don't work,
+          // the SoftAP is our only way to recover.
+          state->blockWiFiReconnectsUntil = now(29 * 1000);
+          ESP_ERROR_CHECK(esp_timer_start_once(timer, 30 * 1000 * 1000));
+          auto mode = preferredWiFiMode(state, false);
+          if (mode == WIFI_MODE_APSTA || mode == WIFI_MODE_STA)
+            esp_wifi_connect();
+        }
       } break;
       case WIFI_EVENT_AP_START:
+        ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "AP_START");
         static TaskHandle_t handle{};
         if (!handle) {
-          xTaskCreate(captivePortalDNS, "captivedns", 4096, state.ap,
+          xTaskCreate(captivePortalDNS, "captivedns", 4096, state->ap,
                       configMAX_PRIORITIES - 1, &handle);
         }
         break;
       case WIFI_EVENT_AP_STACONNECTED:
-      case WIFI_EVENT_AP_STADISCONNECTED: {
-        // The ESP32 only has a single radio. This means, while scanning for
-        // WiFi networks to connect to in STA mode, it can't reliably
-        // maintain connections in AP mode. As a work-around, we leave APSTA
-        // mode in favor of plain AP mode, whenever somebody is connected to
-        // our SoftAP. On the other hand, if there is a working WiFi
-        // connection in both WiFi modes, no need to stop APSTA, as we
-        // aren't expected to start scanning.
-        wifi_mode_t mode{};
-        wifi_sta_list_t sta{};
-        wifi_ap_record_t ap{};
-        if (esp_wifi_get_mode(&mode) == ESP_OK &&
-            esp_wifi_ap_get_sta_list(&sta) == ESP_OK) {
-          bool online = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
-          wifi_mode_t target =
-              sta.num && !online ? WIFI_MODE_AP : WIFI_MODE_APSTA;
-          ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
-                   "Currently in %s mode, %d clients are connected to us and "
-                   "we are %sonline",
-                   mode == WIFI_MODE_APSTA ? "APSTA" : "AP", sta.num,
-                   online ? "" : "not ");
-          if (target != mode) {
-            ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "Changing WiFi mode to %s",
-                     target == WIFI_MODE_APSTA ? "APSTA" : "AP");
-            esp_wifi_set_mode(target);
-          }
-        }
-      } break;
+      case WIFI_EVENT_AP_STADISCONNECTED:
+        ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME, "%s",
+                 eventId == WIFI_EVENT_AP_STACONNECTED ? "AP_STACONNECTED"
+                                                       : "AP_STADISCONNECTED");
+        preferredWiFiMode(state, eventId == WIFI_EVENT_AP_STADISCONNECTED);
+        break;
       default:
         break;
     }
@@ -1084,82 +1396,53 @@ static void wifiEventHandler(void* arg,
 // depending on whether we know the WiFi password for the local network
 // already.
 static void initNetwork() {
-  static NetworkState state{};
-  bool isSta{!!wifiStaConfig.sta.ssid[0]};
+  static NetworkState state{
+      // Our WiFi settings for both STA (if available) and AP mode.
+      .apCfg{.ssid{CONFIG_LWIP_LOCAL_HOSTNAME},
+             .ssid_len{sizeof(CONFIG_LWIP_LOCAL_HOSTNAME) - 1},
+             .channel{1},
+             .authmode{WIFI_AUTH_OPEN},
+             .max_connection{2}},
+      .staCfg{.scan_method{WIFI_ALL_CHANNEL_SCAN},
+              .threshold{.authmode{WIFI_AUTH_OPEN}},
+              .pmf_cfg{.capable{true}, .required{false}},
+              .failure_retry_cnt{3}}};
+  syncNVS(&state);
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+  bool isSta{!!state.staCfg.ssid[0]};
   if (esp_netif_init() != ESP_OK || esp_event_loop_create_default() != ESP_OK ||
-      esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                          &wifiEventHandler, &state,
-                                          NULL) != ESP_OK ||
       (isSta && ((state.sta = esp_netif_create_default_wifi_sta()) == NULL ||
-                 esp_netif_set_hostname(
-                     state.sta, (char*)wifiApConfig.ap.ssid) != ESP_OK)) ||
+                 esp_netif_set_hostname(state.sta, (char*)state.apCfg.ssid) !=
+                     ESP_OK)) ||
       (state.ap = esp_netif_create_default_wifi_ap()) == NULL ||
-      esp_wifi_init(&cfg) != ESP_OK ||
-      esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK ||
-      esp_wifi_set_mode(isSta ? WIFI_MODE_APSTA : WIFI_MODE_AP) != ESP_OK ||
-      (isSta && esp_wifi_set_config(WIFI_IF_STA, &wifiStaConfig) != ESP_OK) ||
-      esp_wifi_set_config(WIFI_IF_AP, &wifiApConfig) != ESP_OK ||
-      esp_wifi_start() != ESP_OK) {
+      !(state.httpServer = initHTTPD(&state))) {
     ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
              "Something is really wrong with WiFi. Rebooting...");
     reboot();
   }
-  initHTTPD(&state);
-  return;
-}
-
-// Non-volatile storage must be initialized if using WiFi. Conveniently,
-// we can also store WiFi credentials and all sort of other settings in
-// NVS storage. It's just a general-purpose key-value store.
-static void initNVS() {
-  const auto initStatus{nvs_flash_init()};
-  if (initStatus == ESP_ERR_NVS_NO_FREE_PAGES ||
-      initStatus == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    nvs_flash_erase();
-    nvs_flash_init();
-  }
-  // If the user previously provided us with WiFi credentials, we can
-  // use them to turn on STA mode.
-  nvs_handle_t hd{};
-  auto& ssid{wifiStaConfig.sta.ssid};
-  auto& pswd{wifiStaConfig.sta.password};
-  auto ssidSz{sizeof(ssid) - 1};
-  auto pswdSz{sizeof(pswd) - 1};
-  if (nvs_open("default", NVS_READWRITE, &hd) == ESP_OK &&
-      nvs_get_blob(hd, "ssid", (char*)&ssid, &ssidSz) == ESP_OK &&
-      nvs_get_blob(hd, "pswd", (char*)&pswd, &pswdSz) == ESP_OK) {
-    ssid[ssidSz] = pswd[pswdSz] = '\000';
-  }
-  // We store a unique identifier in NVS. This is derived from the main
-  // MAC (which is not guaranteed to be unique), and from the limited
-  // amount of true randomness that we collected during boot up.
-  uint8_t uniqueId[16];
-  auto uniqueSz = sizeof(uniqueId);
-  if (nvs_get_blob(hd, "uniq", (char*)&uniqueId, &uniqueSz) != ESP_OK) {
-    MD5Context md5ctx;
-    esp_rom_md5_init(&md5ctx);
-    esp_fill_random(uniqueId, sizeof(uniqueId));
-    esp_rom_md5_update(&md5ctx, uniqueId, sizeof(uniqueId));
-    esp_efuse_mac_get_default(uniqueId);
-    esp_rom_md5_update(&md5ctx, uniqueId, sizeof(uniqueId));
-    esp_rom_md5_final(uniqueId, &md5ctx);
-    nvs_set_blob(hd, "uniq", (char*)uniqueId, uniqueSz);
-    nvs_commit(hd);
-    // While we collected 16 bytes of unique identifier, we only use the
-    // first six in places such as the host name and the name of the
-    // SoftAP.
-    ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
-             "Unique ID: %02X %02X %02X %02X %02X %02X", uniqueId[0],
-             uniqueId[1], uniqueId[2], uniqueId[3], uniqueId[4], uniqueId[5]);
-  }
-  snprintf((char*)wifiApConfig.ap.ssid + wifiApConfig.ap.ssid_len,
-           sizeof(wifiApConfig.ap.ssid), "-%02X%02X%02X", uniqueId[0],
-           uniqueId[1], uniqueId[2]);
-  wifiApConfig.ap.ssid_len = strlen((char*)wifiApConfig.ap.ssid);
-  if (hd) {
-    nvs_close(hd);
-  }
+  httpd_queue_work(
+      state.httpServer,
+      [](void*) {
+        bool isSta{!!state.staCfg.ssid[0]};
+        if (esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                &wifiEventHandler, &state,
+                                                NULL) != ESP_OK ||
+            esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK ||
+            esp_wifi_set_mode(isSta ? WIFI_MODE_APSTA : WIFI_MODE_AP) !=
+                ESP_OK ||
+            (isSta &&
+             esp_wifi_set_config(WIFI_IF_STA, (wifi_config_t*)&state.staCfg) !=
+                 ESP_OK) ||
+            esp_wifi_set_config(WIFI_IF_AP, (wifi_config_t*)&state.apCfg) !=
+                ESP_OK ||
+            esp_wifi_start() != ESP_OK) {
+          ESP_LOGI(CONFIG_LWIP_LOCAL_HOSTNAME,
+                   "Something is really wrong with WiFi. Rebooting...");
+          reboot();
+        }
+      },
+      NULL);
   return;
 }
 
@@ -1171,8 +1454,8 @@ extern "C" void app_main() {
   if (!inTestAppPartition()) switchPartitionMode(false);
 
   // Enable WiFi network.
-  initNVS();
   initNetwork();
+  return;
 
   if (!inTestAppPartition()) {
     // If our partition table is currently not optimal and allocates too
